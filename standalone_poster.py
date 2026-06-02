@@ -73,6 +73,7 @@ def load_config():
         "gemini_api_key": "",
         "naver_id":       "",
         "naver_pw":       "",
+        "gemini_model":   "",
     }
     if os.path.exists(path):
         try:
@@ -81,6 +82,7 @@ def load_config():
             cfg["gemini_api_key"] = dpapi_decrypt(loaded.get("gemini_api_key", ""))
             cfg["naver_id"]       = dpapi_decrypt(loaded.get("naver_id", ""))
             cfg["naver_pw"]       = dpapi_decrypt(loaded.get("naver_pw", ""))
+            cfg["gemini_model"]   = loaded.get("gemini_model", "")  # 평문 저장
         except Exception:
             pass
     return cfg
@@ -97,6 +99,7 @@ def save_config(cfg):
     existing_cfg["gemini_api_key"] = dpapi_encrypt(cfg.get("gemini_api_key", existing_cfg.get("gemini_api_key", "")))
     existing_cfg["naver_id"]       = dpapi_encrypt(cfg.get("naver_id", existing_cfg.get("naver_id", "")))
     existing_cfg["naver_pw"]       = dpapi_encrypt(cfg.get("naver_pw", existing_cfg.get("naver_pw", "")))
+    existing_cfg["gemini_model"]   = cfg.get("gemini_model", existing_cfg.get("gemini_model", ""))
     with open(path, "w", encoding="utf-8") as f:
         json.dump(existing_cfg, f, ensure_ascii=False, indent=2)
 
