@@ -5,8 +5,10 @@ news_analyzer.py — 뉴스 기사 분석 UI 섹션
 """
 import re
 import json
+import html
 import threading
 import traceback
+import webbrowser
 import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -24,6 +26,60 @@ except ImportError:
     pass  # 오류는 gui_app.py 에서 처리
 
 KST = timezone(timedelta(hours=9))
+
+# ── 구글 뉴스 RSS 프리셋 ────────────────────────────────────────────
+# 국가: 표시명 → (hl, gl, ceid)
+COUNTRY_PRESETS = {
+    "🇰🇷 한국": ("ko",    "KR", "KR:ko"),
+    "🇺🇸 미국": ("en-US", "US", "US:en"),
+}
+
+# 카테고리: 표시명 → 구글 뉴스 TOPIC 코드 ("" = 메인 헤드라인)
+CATEGORY_PRESETS = {
+    "전체 헤드라인": "",
+    "경제/비즈니스": "BUSINESS",
+    "기술":          "TECHNOLOGY",
+    "과학":          "SCIENCE",
+    "건강":          "HEALTH",
+    "스포츠":        "SPORTS",
+    "엔터테인먼트":  "ENTERTAINMENT",
+    "세계":          "WORLD",
+}
+
+# 기간: 표시명 → 구글 뉴스 when: 연산자 값 ("" = 제한 없음)
+PERIOD_PRESETS = {
+    "전체 기간": "",
+    "오늘(1일)": "1d",
+    "최근 3일":  "3d",
+    "이번주(7일)": "7d",
+    "이번달(30일)": "30d",
+}
+
+
+def build_google_news_url(country: str, category: str, query: str, period: str) -> str:
+    """
+    드롭다운 선택값으로 구글 뉴스 RSS URL을 조립한다.
+    - 검색어가 있으면 search 엔드포인트(검색어 + when: 기간)
+    - 검색어가 없으면 topic 헤드라인(또는 메인 헤드라인)
+    """
+    hl, gl, ceid = COUNTRY_PRESETS.get(country, COUNTRY_PRESETS["🇰🇷 한국"])
+    locale = f"hl={hl}&gl={gl}&ceid={ceid}"
+    query = (query or "").strip()
+
+    if query:
+        when = PERIOD_PRESETS.get(period, "")
+        q = f"{query} when:{when}" if when else query
+        from urllib.parse import quote
+        return (
+            f"https://news.google.com/rss/search?q={quote(q)}&{locale}"
+        )
+
+    topic = CATEGORY_PRESETS.get(category, "")
+    if topic:
+        return (
+            f"https://news.google.com/rss/headlines/section/topic/{topic}?{locale}"
+        )
+    return f"https://news.google.com/rss?{locale}"
 
 
 class NewsAnalyzerSection:
@@ -65,6 +121,76 @@ class NewsAnalyzerSection:
             pady=10,
         )
         rss_frame.pack(fill="x", pady=4)
+
+        # ─ RSS 빌더 (국가 / 카테고리 / 검색어 / 기간) ─
+        builder = tk.Frame(rss_frame, bg=self.bg_card)
+        builder.pack(fill="x", pady=(0, 6))
+
+        def _mk_label(parent, text):
+            return tk.Label(
+                parent, text=text,
+                font=("맑은 고딕", 9, "bold"),
+                bg=self.bg_card, fg=self.text_dark,
+            )
+
+        # 1행: 국가 / 카테고리 / 기간
+        row1 = tk.Frame(builder, bg=self.bg_card)
+        row1.pack(fill="x", pady=(0, 4))
+
+        _mk_label(row1, "국가:").pack(side="left", padx=(0, 4))
+        self.country_var = tk.StringVar(value="🇰🇷 한국")
+        ttk.Combobox(
+            row1, textvariable=self.country_var,
+            values=list(COUNTRY_PRESETS.keys()),
+            state="readonly", width=9, font=("맑은 고딕", 9),
+        ).pack(side="left", padx=(0, 10))
+
+        _mk_label(row1, "카테고리:").pack(side="left", padx=(0, 4))
+        self.category_var = tk.StringVar(value="전체 헤드라인")
+        ttk.Combobox(
+            row1, textvariable=self.category_var,
+            values=list(CATEGORY_PRESETS.keys()),
+            state="readonly", width=13, font=("맑은 고딕", 9),
+        ).pack(side="left", padx=(0, 10))
+
+        _mk_label(row1, "기간:").pack(side="left", padx=(0, 4))
+        self.period_var = tk.StringVar(value="이번주(7일)")
+        ttk.Combobox(
+            row1, textvariable=self.period_var,
+            values=list(PERIOD_PRESETS.keys()),
+            state="readonly", width=11, font=("맑은 고딕", 9),
+        ).pack(side="left")
+
+        # 2행: 검색어 + URL 생성 버튼
+        row2 = tk.Frame(builder, bg=self.bg_card)
+        row2.pack(fill="x")
+
+        _mk_label(row2, "검색어:").pack(side="left", padx=(0, 4))
+        self.query_entry = tk.Entry(
+            row2, bg=self.bg_input, fg=self.text_dark,
+            insertbackground=self.text_dark, bd=2, relief="solid",
+            font=("맑은 고딕", 9),
+        )
+        self.query_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+        build_btn = tk.Button(
+            row2, text="🔧 URL 생성",
+            font=("맑은 고딕", 9, "bold"),
+            bg=self.accent, fg=self.text_dark,
+            activebackground=self.hover_dark, activeforeground=self.text_dark,
+            bd=0, relief="flat", cursor="hand2",
+            padx=12, pady=4,
+            command=self._build_url_from_presets,
+        )
+        build_btn.pack(side="left")
+        self._bind_hover(build_btn, self.accent, self.hover_dark)
+
+        tk.Label(
+            builder,
+            text="※ 검색어가 있으면 검색 기반, 없으면 카테고리 헤드라인으로 URL을 만듭니다.",
+            font=("맑은 고딕", 8),
+            bg=self.bg_card, fg=self.text_muted, anchor="w",
+        ).pack(fill="x", pady=(2, 0))
 
         # ─ URL 입력 ─
         url_row = tk.Frame(rss_frame, bg=self.bg_card)
@@ -201,9 +327,12 @@ class NewsAnalyzerSection:
             btn.pack(side="left", padx=(0, 4))
             self._bind_hover(btn, self.accent, self.hover_dark)
 
-        # ─ 분석 & 저장 버튼 (Blue) ─
+        # ─ 분석 & 저장 버튼 (Blue) + 열어보기 버튼 ─
+        btn_row = tk.Frame(rss_frame, bg=self.bg_card)
+        btn_row.pack(fill="x", pady=(4, 0))
+
         self.analyze_btn = tk.Button(
-            rss_frame,
+            btn_row,
             text="📊  선택된 기사 분석하여 파일 저장",
             font=("맑은 고딕", 11, "bold"),
             bg=self.btn_rss,
@@ -213,8 +342,42 @@ class NewsAnalyzerSection:
             padx=20, pady=12,
             command=self.start_analysis_thread,
         )
-        self.analyze_btn.pack(fill="x", pady=(4, 0))
+        self.analyze_btn.pack(side="left", fill="x", expand=True)
         self._bind_hover(self.analyze_btn, self.btn_rss, self.tertiary_hov)
+
+        self.open_btn = tk.Button(
+            btn_row,
+            text="🌐 열어보기",
+            font=("맑은 고딕", 10, "bold"),
+            bg=self.primary,
+            fg=self.text_light,
+            activebackground=self.accent, activeforeground=self.text_dark,
+            bd=0, relief="flat", cursor="hand2",
+            padx=14, pady=12,
+            state="disabled",
+            command=self._open_saved_file,
+        )
+        self.open_btn.pack(side="left", padx=(6, 0))
+        self._bind_hover(self.open_btn, self.primary, self.accent)
+        self.last_saved_path: str = ""
+
+    # ──────────────────────────────────────────────
+    # RSS URL 빌더
+    # ──────────────────────────────────────────────
+    def _build_url_from_presets(self) -> None:
+        """드롭다운 선택값으로 URL을 만들어 URL 입력칸에 채우고 바로 불러온다."""
+        url = build_google_news_url(
+            self.country_var.get(),
+            self.category_var.get(),
+            self.query_entry.get(),
+            self.period_var.get(),
+        )
+        self.rss_url_entry.delete(0, tk.END)
+        self.rss_url_entry.insert(0, url)
+        self.article_count_lbl.configure(
+            text=f"URL 생성됨 → 자동으로 기사를 불러옵니다... ({url[:70]}…)"
+        )
+        self.load_rss_articles()
 
     # ──────────────────────────────────────────────
     # UI 헬퍼
@@ -429,58 +592,40 @@ class NewsAnalyzerSection:
             print(f"✅ 제목: {title} ({now_display})")
             print(f"   소제목 {len(sub_titles)}개 / 태그 {len(tags)}개")
 
-            # 파일 경로
+            # 2단계: 소제목 전체 일괄 분석 (API 1회 요청)
+            total = len(sub_titles)
+            print(f"[2단계] {total}개 소제목 일괄 분석 중... (API 1회 요청)")
+            self.root.after(
+                0,
+                lambda n=total: self.analyze_btn.configure(
+                    text=f"일괄 분석 중... ({n}개) ⏳"
+                ),
+            )
+            all_analyses = self._gen_all_analyses(client, art_text, sub_titles, model_id)
+            print(f"   ✅ {total}개 분석 완료 (총 API 호출: 2회)")
+
+            # 3단계: HTML 문서 작성 후 저장
             lists_dir = Path.home() / "Desktop" / "lists"
             lists_dir.mkdir(parents=True, exist_ok=True)
             safe_title = re.sub(r'[\\/:*?"<>|]', "", title).strip()
             safe_name  = re.sub(r"\s+", " ", f"{now_filename} {safe_title}")[:80]
-            file_path  = lists_dir / f"{safe_name}.txt"
+            file_path  = lists_dir / f"{safe_name}.html"
 
-            total = len(sub_titles)
-            with open(file_path, "w", encoding="utf-8") as f:
+            html_doc = self._build_html(title, now_display, all_analyses, articles, tags)
+            file_path.write_text(html_doc, encoding="utf-8")
+            print("[3단계] HTML 문서 작성 완료 (출처·태그 포함)")
 
-                # 제목 + 날짜/시간 기록
-                f.write(f"제목: {title}\n")
-                f.write(f"작성 일시: {now_display} (KST)\n\n")
-                f.write("=" * 60 + "\n")
-                f.flush()
-
-                # 2단계: 소제목 전체 일괄 분석 (API 1회 요청)
-                print(f"[2단계] {total}개 소제목 일괄 분석 중... (API 1회 요청)")
-                self.root.after(
-                    0,
-                    lambda n=total: self.analyze_btn.configure(
-                        text=f"일괄 분석 중... ({n}개) ⏳"
-                    ),
-                )
-                all_analyses = self._gen_all_analyses(client, art_text, sub_titles, model_id)
-
-                for sub_title, analysis in all_analyses:
-                    f.write(f"\n{sub_title}\n\n{analysis}\n\n")
-                    f.flush()
-                print(f"   ✅ {total}개 분석 완료 (총 API 호출: 2회)")
-
-                # 3단계: 출처 기사
-                f.write("\n" + "=" * 60 + "\n")
-                f.write("출처 기사:\n")
-                for art in articles:
-                    f.write(f"  - {art['title']} ({art.get('display_date', '')})\n")
-                f.flush()
-                print("[3단계] 출처 기사 기록 완료")
-
-                # 4단계: 태그 (맨 마지막)
-                f.write("\n" + "=" * 60 + "\n")
-                f.write("태그: " + "  ".join(f"#{t}" for t in tags) + "\n")
-
-            print("[4단계] 태그 기록 완료 → 파일 닫힘")
             fp_str = str(file_path)
+            self.last_saved_path = fp_str
+            self.root.after(0, lambda: self.open_btn.configure(state="normal"))
             print(f"💾 저장 완료: {fp_str}\n" + "=" * 60)
 
             self.root.after(
                 0,
                 lambda: messagebox.showinfo(
                     "분석 & 저장 완료",
-                    f"분석 포스팅이 저장되었습니다!\n\n📁 저장 위치:\n{fp_str}",
+                    f"분석 포스팅이 저장되었습니다!\n\n📁 저장 위치:\n{fp_str}\n\n"
+                    "[🌐 열어보기] 버튼으로 브라우저에서 바로 열 수 있습니다.",
                 ),
             )
 
@@ -499,6 +644,72 @@ class NewsAnalyzerSection:
                     self.analyze_btn, "📊 선택된 기사 분석하여 파일 저장", self.btn_rss
                 ),
             )
+
+    # ──────────────────────────────────────────────
+    # HTML 작성 / 열어보기
+    # ──────────────────────────────────────────────
+    def _build_html(self, title, now_display, analyses, articles, tags) -> str:
+        esc = html.escape
+
+        sections = ""
+        for sub_title, analysis in analyses:
+            paras = "".join(
+                f"<p>{esc(p.strip())}</p>"
+                for p in str(analysis).split("\n") if p.strip()
+            )
+            sections += f"<h2>{esc(sub_title)}</h2>\n{paras}\n"
+
+        sources = "".join(
+            f"<li>{esc(a['title'])} "
+            f"<span class='date'>({esc(a.get('display_date', ''))})</span></li>"
+            for a in articles
+        )
+        tag_html = " ".join(f"<span class='tag'>#{esc(str(t))}</span>" for t in tags)
+
+        return f"""<!DOCTYPE html>
+<html lang="ko"><head><meta charset="utf-8">
+<title>{esc(title)}</title>
+<style>
+  body {{ font-family:'맑은 고딕','Malgun Gothic',sans-serif; max-width:880px;
+          margin:0 auto; padding:24px; color:#1A1A1A; background:#F5F0E8;
+          line-height:1.75; }}
+  h1 {{ border-bottom:4px solid #1A1A1A; padding-bottom:10px; }}
+  h2 {{ background:#FFCC00; display:inline-block; padding:4px 12px;
+        border:2px solid #1A1A1A; margin-top:30px; font-size:18px; }}
+  p {{ margin:10px 0; }}
+  .meta {{ color:#4A4A4A; font-size:13px; }}
+  .box {{ background:#fff; border:3px solid #1A1A1A; padding:14px 18px; margin-top:24px; }}
+  .box h3 {{ margin-top:0; }}
+  .date {{ color:#0055FF; font-size:12px; }}
+  .tag {{ display:inline-block; background:#1A1A1A; color:#FFCC00;
+          padding:3px 8px; margin:3px 4px 3px 0; font-size:12px; border-radius:3px; }}
+  ul {{ padding-left:20px; }}
+</style></head><body>
+<h1>📰 {esc(title)}</h1>
+<p class="meta">작성 일시: {esc(now_display)} (KST) · 분석 기사 {len(articles)}건</p>
+
+{sections}
+
+<div class="box">
+<h3>📎 출처 기사</h3>
+<ul>{sources}</ul>
+</div>
+
+<div class="box">
+<h3># 태그</h3>
+{tag_html}
+</div>
+
+<p class="meta" style="margin-top:28px;">
+※ 구글 뉴스 RSS 기사를 Gemini AI로 분석해 작성한 문서입니다.</p>
+</body></html>"""
+
+    def _open_saved_file(self) -> None:
+        """가장 최근 저장한 HTML 리포트를 기본 브라우저로 연다."""
+        if self.last_saved_path and Path(self.last_saved_path).exists():
+            webbrowser.open(Path(self.last_saved_path).as_uri())
+        else:
+            messagebox.showinfo("열어보기", "먼저 기사를 분석하여 파일을 저장해 주세요.")
 
     # ──────────────────────────────────────────────
     # 유틸

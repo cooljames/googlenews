@@ -34,6 +34,11 @@ except ImportError:
 
 from news_analyzer import NewsAnalyzerSection
 
+try:
+    from stock_report import StockReportSection
+except ImportError:
+    StockReportSection = None  # yfinance/matplotlib 미설치 시 탭 비활성
+
 # ── Gemini 모델 목록 (표시명 → API ID) ──────────────────────────────
 GEMINI_MODELS = [
     ("Gemini 3.1 Flash Lite", "gemini-3.1-flash-lite"),
@@ -189,10 +194,14 @@ class NaverPosterGUI:
         self.tab_post = tk.Frame(self.notebook, bg=self.bg_dark)
         self.notebook.add(self.tab_post, text="  📝 글쓰기 (Post)  ")
 
+        self.tab_stock = tk.Frame(self.notebook, bg=self.bg_dark)
+        self.notebook.add(self.tab_stock, text="  📈 주식 리포트 (Stock)  ")
+
         self.tab_settings = tk.Frame(self.notebook, bg=self.bg_dark)
         self.notebook.add(self.tab_settings, text="  ⚙️ 설정 (Settings)  ")
 
         self.build_post_tab()
+        self.build_stock_tab()
         self.build_settings_tab()
 
     # ──────────────────────────────────────────────
@@ -247,22 +256,7 @@ class NaverPosterGUI:
         tk.Frame(container, bg=self.border_color, height=3).pack(fill="x", pady=8)
 
         # ── [4] 뉴스 기사 분석 (news_analyzer.py) ──
-        theme = {
-            "bg_card":      self.bg_card,
-            "bg_input":     self.bg_input,
-            "text_light":   self.text_light,
-            "text_dark":    self.text_dark,
-            "text_muted":   self.text_muted,
-            "accent":       self.accent,
-            "hover":        self.hover,
-            "hover_dark":   self.hover_dark,
-            "btn_rss":      self.btn_rss,
-            "tertiary":     self.tertiary,
-            "tertiary_hov": self.tertiary_hov,
-            "primary":      self.primary,
-            "border_color": self.border_color,
-        }
-        self.news_section = NewsAnalyzerSection(self.root, theme)
+        self.news_section = NewsAnalyzerSection(self.root, self._theme_dict())
         self.news_section.build(container)
 
         # ── [5] 로그 창 ──
@@ -286,6 +280,53 @@ class NaverPosterGUI:
             state="disabled",
         )
         self.log_text.pack(fill="both", expand=True)
+
+    # ──────────────────────────────────────────────
+    # 테마 딕셔너리 (섹션 모듈에 전달)
+    # ──────────────────────────────────────────────
+    def _theme_dict(self) -> dict:
+        return {
+            "bg_card":      self.bg_card,
+            "bg_input":     self.bg_input,
+            "text_light":   self.text_light,
+            "text_dark":    self.text_dark,
+            "text_muted":   self.text_muted,
+            "accent":       self.accent,
+            "hover":        self.hover,
+            "hover_dark":   self.hover_dark,
+            "btn_rss":      self.btn_rss,
+            "tertiary":     self.tertiary,
+            "tertiary_hov": self.tertiary_hov,
+            "primary":      self.primary,
+            "border_color": self.border_color,
+        }
+
+    # ──────────────────────────────────────────────
+    # 주식 리포트 탭
+    # ──────────────────────────────────────────────
+    def build_stock_tab(self) -> None:
+        container = tk.Frame(self.tab_stock, bg=self.bg_dark)
+        container.pack(fill="both", expand=True, padx=8, pady=6)
+
+        if StockReportSection is None:
+            tk.Label(
+                container,
+                text=("⚠️ 주식 리포트 기능을 사용하려면 패키지 설치가 필요합니다.\n\n"
+                      "    pip install yfinance matplotlib"),
+                font=("맑은 고딕", 11, "bold"),
+                bg=self.bg_dark, fg=self.error, justify="left",
+            ).pack(pady=40)
+            return
+
+        self.stock_section = StockReportSection(self.root, self._theme_dict())
+        self.stock_section.build(container)
+
+        # 공용 로그 안내
+        tk.Label(
+            container,
+            text="※ 진행 상황은 '글쓰기' 탭 하단의 실시간 작업 로그에 출력됩니다.",
+            font=("맑은 고딕", 8), bg=self.bg_dark, fg=self.text_muted, anchor="w",
+        ).pack(fill="x", pady=(8, 0))
 
     # ──────────────────────────────────────────────
     # 설정 탭

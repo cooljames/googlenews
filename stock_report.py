@@ -1,0 +1,806 @@
+# pyright: reportMissingImports=false
+"""
+stock_report.py — 주식/ETF 뉴스 리포트 섹션
+티커 입력 → yfinance 가격·등락 수집 + 구글 뉴스 RSS → matplotlib 그래프
+→ Gemini 종합 분석 → Desktop/lists/ 에 HTML 리포트 + charts/ 에 PNG 저장
+"""
+import re
+import json
+import html
+import threading
+import traceback
+import webbrowser
+import urllib.request
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from datetime import datetime, timezone, timedelta, time as dtime
+from email.utils import parsedate_to_datetime
+from urllib.parse import quote
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+
+import matplotlib
+matplotlib.use("Agg")  # GUI 스레드와 분리된 백엔드
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+import yfinance as yf
+from google import genai
+from google.genai import types
+
+try:
+    from standalone_poster import load_config
+except ImportError:
+    pass  # 오류는 gui_app.py 에서 처리
+
+KST = timezone(timedelta(hours=9))
+
+# 한글 깨짐 방지 (Windows 기본 폰트)
+matplotlib.rcParams["font.family"] = "Malgun Gothic"
+matplotlib.rcParams["axes.unicode_minus"] = False
+
+# 기간: 표시명 → (yfinance period, 뉴스 검색 when:)
+PERIOD_PRESETS = {
+    "1주": ("7d",  "7d"),
+    "1개월": ("1mo", "14d"),
+    "3개월": ("3mo", "14d"),
+    "6개월": ("6mo", "30d"),
+    "1년":  ("1y",  "30d"),
+    "3년":  ("3y",  "30d"),
+    "5년":  ("5y",  "30d"),
+    "10년": ("10y", "30d"),
+    "전체": ("max", "30d"),
+}
+
+MARKET_PRESETS = {
+    "🇰🇷 한국": ("ko",    "KR", "KR:ko"),
+    "🇺🇸 미국": ("en-US", "US", "US:en"),
+}
+
+# 차트 공통 색상 팔레트 (가격추이·등락률 그래프에서 종목별 동일 색 사용)
+PALETTE = ["#0055FF", "#E63B2E", "#16A085", "#FF8C00",
+           "#8E44AD", "#1A1A1A", "#00A86B", "#C0392B"]
+
+# 한국 종목명·거래소 실시간 조회 (네이버 증권 모바일 API)
+NAVER_STOCK_API = "https://m.stock.naver.com/api/stock/{code}/basic"
+
+
+class StockReportSection:
+    """주식/ETF 뉴스 리포트 섹션. build(container) 로 UI 구성."""
+
+    def __init__(self, root: tk.Tk, theme: dict):
+        self.root         = root
+        self.bg_card      = theme["bg_card"]
+        self.bg_input     = theme["bg_input"]
+        self.text_light   = theme["text_light"]
+        self.text_dark    = theme.get("text_dark", "#1A1A1A")
+        self.text_muted   = theme["text_muted"]
+        self.accent       = theme["accent"]
+        self.hover_dark   = theme.get("hover_dark", "#E6B800")
+        self.btn_rss      = theme["btn_rss"]
+        self.tertiary_hov = theme.get("tertiary_hov", "#003DD6")
+        self.primary      = theme.get("primary", "#1A1A1A")
+        self.border_color = theme.get("border_color", "#1A1A1A")
+        self._kr_cache: dict = {}  # 한국 종목 실시간 조회 캐시 (code → {name, suffix})
+
+    # ──────────────────────────────────────────────
+    # UI 구성
+    # ──────────────────────────────────────────────
+    def build(self, container: tk.Frame) -> None:
+        frame = tk.LabelFrame(
+            container,
+            text="  📈 주식 / ETF 뉴스 리포트  ",
+            font=("맑은 고딕", 10, "bold"),
+            bg=self.bg_card, fg=self.text_dark,
+            bd=3, relief="solid", padx=10, pady=10,
+        )
+        frame.pack(fill="x", pady=4)
+
+        # 안내
+        tk.Label(
+            frame,
+            text="티커를 쉼표로 구분해 입력하세요.  예) 한국: 005930.KS, 069500.KS  /  미국: AAPL, SPY, QQQ",
+            font=("맑은 고딕", 8),
+            bg=self.bg_card, fg=self.text_muted, anchor="w",
+        ).pack(fill="x", pady=(0, 6))
+
+        # 입력 행: 시장 / 기간
+        opt_row = tk.Frame(frame, bg=self.bg_card)
+        opt_row.pack(fill="x", pady=(0, 4))
+
+        tk.Label(opt_row, text="시장:", font=("맑은 고딕", 9, "bold"),
+                 bg=self.bg_card, fg=self.text_dark).pack(side="left", padx=(0, 4))
+        self.market_var = tk.StringVar(value="🇰🇷 한국")
+        ttk.Combobox(opt_row, textvariable=self.market_var,
+                     values=list(MARKET_PRESETS.keys()),
+                     state="readonly", width=9, font=("맑은 고딕", 9)
+                     ).pack(side="left", padx=(0, 10))
+
+        tk.Label(opt_row, text="기간:", font=("맑은 고딕", 9, "bold"),
+                 bg=self.bg_card, fg=self.text_dark).pack(side="left", padx=(0, 4))
+        self.period_var = tk.StringVar(value="1개월")
+        ttk.Combobox(opt_row, textvariable=self.period_var,
+                     values=list(PERIOD_PRESETS.keys()),
+                     state="readonly", width=8, font=("맑은 고딕", 9)
+                     ).pack(side="left")
+
+        # 티커 입력
+        ticker_row = tk.Frame(frame, bg=self.bg_card)
+        ticker_row.pack(fill="x", pady=(0, 6))
+        tk.Label(ticker_row, text="티커:", font=("맑은 고딕", 9, "bold"),
+                 bg=self.bg_card, fg=self.text_dark).pack(side="left", padx=(0, 4))
+        self.ticker_entry = tk.Entry(
+            ticker_row, bg=self.bg_input, fg=self.text_dark,
+            insertbackground=self.text_dark, bd=2, relief="solid",
+            font=("Consolas", 10),
+        )
+        self.ticker_entry.pack(side="left", fill="x", expand=True)
+        self.ticker_entry.insert(0, "005930.KS, 069500.KS")
+
+        # 상태 레이블
+        self.status_lbl = tk.Label(
+            frame,
+            text="티커를 입력하고 [리포트 생성] 버튼을 누르세요.",
+            font=("맑은 고딕", 8), bg=self.bg_card, fg=self.text_muted, anchor="w",
+        )
+        self.status_lbl.pack(fill="x", pady=(0, 6))
+
+        # 생성 버튼 + 열어보기 버튼
+        btn_row = tk.Frame(frame, bg=self.bg_card)
+        btn_row.pack(fill="x")
+
+        self.gen_btn = tk.Button(
+            btn_row,
+            text="📊  데이터·뉴스 수집 → 표·그래프·분석 리포트 생성",
+            font=("맑은 고딕", 11, "bold"),
+            bg=self.btn_rss, fg=self.text_light,
+            activebackground=self.tertiary_hov, activeforeground=self.text_light,
+            bd=0, relief="flat", cursor="hand2", padx=20, pady=12,
+            command=self.start_report_thread,
+        )
+        self.gen_btn.pack(side="left", fill="x", expand=True)
+        self.gen_btn.bind("<Enter>", lambda e: self._hover(e, self.tertiary_hov))
+        self.gen_btn.bind("<Leave>", lambda e: self._hover(e, self.btn_rss))
+
+        self.open_btn = tk.Button(
+            btn_row,
+            text="🌐 열어보기",
+            font=("맑은 고딕", 10, "bold"),
+            bg=self.primary, fg=self.text_light,
+            activebackground=self.accent, activeforeground=self.text_dark,
+            bd=0, relief="flat", cursor="hand2", padx=14, pady=12,
+            state="disabled",
+            command=self._open_report,
+        )
+        self.open_btn.pack(side="left", padx=(6, 0))
+        self.open_btn.bind("<Enter>", lambda e: self._hover(e, self.accent))
+        self.open_btn.bind("<Leave>", lambda e: self._hover(e, self.primary))
+        self.last_html_path: str = ""
+
+    def _hover(self, event, color: str) -> None:
+        if event.widget["state"] != "disabled":
+            event.widget["background"] = color
+
+    # ──────────────────────────────────────────────
+    # 실행
+    # ──────────────────────────────────────────────
+    def start_report_thread(self) -> None:
+        raw = self.ticker_entry.get().strip()
+        market = self.market_var.get()
+        tickers = [
+            self._normalize_ticker(t, market)
+            for t in raw.split(",") if t.strip()
+        ]
+        if not tickers:
+            messagebox.showwarning("입력 오류", "티커를 하나 이상 입력해 주세요.")
+            return
+
+        cfg = load_config()
+        if not cfg.get("gemini_api_key"):
+            messagebox.showwarning("설정 오류",
+                "Gemini API Key가 설정되지 않았습니다.\n설정 탭에서 입력해 주세요.")
+            return
+
+        self.gen_btn.configure(state="disabled", text="리포트 생성 중... ⏳", bg="#4A4A4A")
+        threading.Thread(
+            target=self._run_report, args=(cfg, tickers), daemon=True
+        ).start()
+
+    def _run_report(self, cfg: dict, tickers: list) -> None:
+        try:
+            print("\n" + "=" * 60)
+            print(f"📈 주식 리포트 시작 — 티커: {', '.join(tickers)}")
+
+            period_label = self.period_var.get()
+            yf_period, news_when = PERIOD_PRESETS.get(period_label, ("1mo", "14d"))
+            market = self.market_var.get()
+
+            # 1) 가격 데이터 수집
+            self._set_status("가격 데이터 수집 중...")
+            price_rows, price_series = self._collect_prices(tickers, yf_period, market)
+            if not price_rows:
+                raise RuntimeError("가격 데이터를 가져오지 못했습니다. 티커를 확인하세요.")
+
+            # 2) 뉴스 수집
+            self._set_status("뉴스 헤드라인 수집 중...")
+            news_map = self._collect_news(price_rows, market, news_when)
+
+            # 3) 차트 생성
+            self._set_status("그래프 생성 중...")
+            now = datetime.now(KST)
+            charts_dir = Path.home() / "Desktop" / "lists" / "charts"
+            charts_dir.mkdir(parents=True, exist_ok=True)
+            stamp = now.strftime("%Y-%m-%d_%H-%M")
+            line_png = charts_dir / f"price_{stamp}.png"
+            bar_png  = charts_dir / f"return_{stamp}.png"
+            # 두 그래프에서 종목별로 동일한 색을 쓰도록 색상 맵 구성
+            color_map = {
+                r["symbol"]: PALETTE[i % len(PALETTE)]
+                for i, r in enumerate(price_rows)
+            }
+            # 그래프 라벨: 한글 종목명만 사용 (코드 제외)
+            name_map = {r["symbol"]: r["name"] for r in price_rows}
+            self._make_line_chart(price_series, line_png, period_label, color_map, name_map)
+            self._make_bar_chart(price_rows, bar_png, period_label, color_map, name_map)
+
+            # 4) Gemini 분석
+            self._set_status("Gemini 종합 분석 중...")
+            analysis = self._gen_analysis(
+                cfg, price_rows, news_map, period_label, market
+            )
+
+            # 5) HTML 리포트 저장 (파일명에 한글 종목명 포함)
+            self._set_status("HTML 리포트 저장 중...")
+            lists_dir = Path.home() / "Desktop" / "lists"
+            lists_dir.mkdir(parents=True, exist_ok=True)
+            names_label = self._filename_names(price_rows)
+            html_path = lists_dir / f"{stamp} 주식리포트 {names_label}.html"
+            self._write_html(
+                html_path, price_rows, news_map, analysis,
+                line_png, bar_png, period_label, market, now,
+            )
+
+            fp = str(html_path)
+            self.last_html_path = fp
+            self.root.after(0, lambda: self.open_btn.configure(state="normal"))
+            print(f"💾 저장 완료: {fp}\n" + "=" * 60)
+            self.root.after(0, lambda: messagebox.showinfo(
+                "리포트 생성 완료",
+                f"주식 뉴스 리포트가 저장되었습니다!\n\n📁 {fp}\n\n"
+                "[🌐 열어보기] 버튼으로 브라우저에서 바로 열 수 있습니다.",
+            ))
+
+        except Exception as e:
+            err = str(e)
+            print(f"\n❌ 리포트 생성 오류:\n{err}\n{traceback.format_exc()}")
+            self.root.after(0, lambda: messagebox.showerror(
+                "리포트 실패", f"리포트 생성 중 오류가 발생했습니다:\n\n{err}"))
+        finally:
+            self.root.after(0, lambda: self.gen_btn.configure(
+                state="normal",
+                text="📊  데이터·뉴스 수집 → 표·그래프·분석 리포트 생성",
+                bg=self.btn_rss,
+            ))
+
+    def _set_status(self, msg: str) -> None:
+        print(f"  · {msg}")
+        self.root.after(0, lambda: self.status_lbl.configure(text=msg))
+
+    def _filename_names(self, price_rows: list) -> str:
+        """파일명용 한글 종목명 문자열. 예: '삼성전자·HK이노엔' (4개 초과 시 '외 N')."""
+        names = [r["name"] for r in price_rows]
+        shown = names[:4]
+        label = "·".join(shown)
+        if len(names) > 4:
+            label += f" 외 {len(names) - 4}"
+        label = re.sub(r'[\\/:*?"<>|]', "", label).strip()
+        return label[:80] or f"{len(price_rows)}종목"
+
+    def _open_report(self) -> None:
+        """가장 최근 저장한 HTML 리포트를 기본 브라우저로 연다."""
+        if self.last_html_path and Path(self.last_html_path).exists():
+            webbrowser.open(Path(self.last_html_path).as_uri())
+        else:
+            messagebox.showinfo("열어보기", "먼저 리포트를 생성해 주세요.")
+
+    # ──────────────────────────────────────────────
+    # 티커 정규화 / 다운로드
+    # ──────────────────────────────────────────────
+    def _lookup_kr(self, code: str):
+        """네이버 증권에서 한국 종목의 한글명·거래소를 실시간 조회 (캐시).
+        Returns {'name': 한글명, 'suffix': '.KS'|'.KQ'} 또는 None."""
+        code = re.sub(r"\.[A-Z]+$", "", code.strip().upper())
+        if not re.fullmatch(r"\d{4,6}", code):
+            return None
+        if code in self._kr_cache:
+            return self._kr_cache[code]
+
+        result = None
+        try:
+            req = urllib.request.Request(
+                NAVER_STOCK_API.format(code=code),
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            name = (data.get("stockName") or "").strip()
+            ex   = data.get("stockExchangeType") or {}
+            ex_code = ex.get("code") if isinstance(ex, dict) else ex
+            if name:
+                result = {
+                    "name":   name,
+                    "suffix": ".KQ" if ex_code == "KQ" else ".KS",
+                }
+        except Exception as e:
+            print(f"  [경고] {code} 종목명 실시간 조회 실패: {e}")
+
+        self._kr_cache[code] = result
+        return result
+
+    def _normalize_ticker(self, raw: str, market: str) -> str:
+        """'005930' 처럼 코드만 입력해도 한국 시장이면 실시간 조회로 .KS/.KQ 부착."""
+        sym = raw.strip().upper()
+        if market == "🇰🇷 한국" and re.fullmatch(r"\d{4,6}", sym):
+            info = self._lookup_kr(sym)
+            return f"{sym}{info['suffix']}" if info else f"{sym}.KS"
+        return sym
+
+    def _kr_candidates(self, sym: str) -> list:
+        """한국 코드 심볼의 거래소 후보. 실시간 조회로 거래소가 확인되면 그것만,
+        실패하면 .KS / .KQ 둘 다 검증 대상으로 반환."""
+        m = re.fullmatch(r"(\d{4,6})\.(?:KS|KQ)", sym)
+        if not m:
+            return [sym]
+        code = m.group(1)
+        info = self._lookup_kr(code)
+        if info:
+            return [f"{code}{info['suffix']}"]
+        return [f"{code}.KS", f"{code}.KQ"]
+
+    def _download_history(self, sym: str, yf_period: str):
+        """심볼로 시세를 받되, 거래소를 확인할 수 없는 한국 코드는
+        .KS/.KQ 후보 중 데이터가 있는 거래소를 선택한다.
+        Returns: (실제로 데이터를 받은 심볼, hist DataFrame|None)."""
+        candidates = self._kr_candidates(sym)
+        for cand in candidates:
+            try:
+                h = yf.Ticker(cand).history(period=yf_period, auto_adjust=False)
+                if h is not None and not h.empty:
+                    return cand, h
+            except Exception as e:
+                print(f"  [경고] {cand} 다운로드 실패: {e}")
+        return sym, None
+
+    # ──────────────────────────────────────────────
+    # 데이터 수집
+    # ──────────────────────────────────────────────
+    def _collect_prices(self, tickers: list, yf_period: str, market: str = "🇰🇷 한국"):
+        """yfinance 로 가격 수집 → (요약행 리스트, {티커: 종가 시리즈})."""
+        rows, series = [], {}
+        for sym in tickers:
+            try:
+                sym, hist = self._download_history(sym, yf_period)
+                if hist is None or hist.empty:
+                    print(f"  [경고] {sym}: 데이터 없음 (건너뜀)")
+                    continue
+                tk_obj = yf.Ticker(sym)
+
+                close = hist["Close"].dropna()
+                if close.empty:
+                    continue
+
+                first = float(close.iloc[0])
+                last  = float(close.iloc[-1])
+                prev  = float(close.iloc[-2]) if len(close) >= 2 else first
+                day_chg    = (last / prev - 1) * 100 if prev else 0.0
+                period_chg = (last / first - 1) * 100 if first else 0.0
+                volume = int(hist["Volume"].iloc[-1]) if "Volume" in hist else 0
+
+                # 기간 고가/저가는 장중 High/Low 기준 (실제 최고·최저가)
+                high = float(hist["High"].max()) if "High" in hist else last
+                low  = float(hist["Low"].min())  if "Low"  in hist else last
+
+                # 당일 시세 (네이버 일간 시세 형식)
+                day_open = float(hist["Open"].iloc[-1]) if "Open" in hist else last
+                day_high = float(hist["High"].iloc[-1]) if "High" in hist else last
+                day_low  = float(hist["Low"].iloc[-1])  if "Low"  in hist else last
+
+                name = self._ticker_name(tk_obj, sym)
+                rows.append({
+                    "symbol":      sym,
+                    "name":        name,
+                    "last":        last,             # 현재(기간 최종) 종가
+                    "last_dt":     self._fmt_dt(close.index[-1], market),  # 장 최종 일시(장 마감 시간)
+                    "day_chg":     day_chg,
+                    "period_chg":  period_chg,
+                    "high":        high,             # 기간 고가
+                    "low":         low,              # 기간 저가
+                    "volume":      volume,
+                    # 당일 시세 스냅샷
+                    "prev_close":  prev,
+                    "diff":        last - prev,       # 전일대비 (금액)
+                    "day_open":    day_open,
+                    "day_high":    day_high,
+                    "day_low":     day_low,
+                    "trade_value": volume * last,     # 거래대금(근사: 거래량×종가)
+                })
+                series[sym] = close
+                print(f"  ✓ {sym} ({name}): 종가 {last:,.2f}  기간 {period_chg:+.2f}%")
+            except Exception as e:
+                print(f"  [경고] {sym} 수집 실패: {e}")
+        return rows, series
+
+    def _ticker_name(self, tk_obj, sym: str) -> str:
+        # 1) 한국 종목: 네이버 실시간 한글명
+        info = self._lookup_kr(sym)
+        if info and info["name"]:
+            return info["name"]
+        # 2) yfinance 영문명 (주로 미국 종목)
+        try:
+            meta = tk_obj.info or {}
+            return meta.get("longName") or meta.get("shortName") or sym
+        except Exception:
+            return sym
+
+    def _fmt_dt(self, ts, market: str = "🇰🇷 한국") -> str:
+        """최종 거래일 + 장 마감 시간으로 표기.
+        한국(KRX) 15:30, 미국(NYSE/NASDAQ) 16:00 (각 시장 현지 마감)."""
+        try:
+            d = ts.strftime("%Y-%m-%d")
+        except Exception:
+            d = str(ts)[:10]
+        close_time = "16:00" if market == "🇺🇸 미국" else "15:30"
+        return f"{d} {close_time}"
+
+    def _collect_news(self, price_rows: list, market: str, when: str) -> dict:
+        """종목별 구글 뉴스 RSS 헤드라인 수집 → {symbol: [기사,...]}.
+        장 마감 시각 이후 발행된 뉴스만 남긴다."""
+        hl, gl, ceid = MARKET_PRESETS.get(market, MARKET_PRESETS["🇰🇷 한국"])
+        out = {}
+        for row in price_rows:
+            sym = row["symbol"]
+            # 검색어: 종목명 우선, 없으면 심볼 베이스(.KS 등 제거)
+            name = row["name"]
+            base = re.sub(r"\.[A-Z]+$", "", sym)
+            query = name if name and name != sym else base
+            q = f"{query} when:{when}" if when else query
+            url = (
+                f"https://news.google.com/rss/search?q={quote(q)}"
+                f"&hl={hl}&gl={gl}&ceid={ceid}"
+            )
+            cutoff = self._market_close_cutoff(row["last_dt"], market)
+            try:
+                items = self._fetch_rss(url)
+                # 장 마감(cutoff) 이후 발행된 뉴스만
+                fresh = [h for h in items if h.get("dt") and h["dt"] >= cutoff]
+                out[sym] = fresh[:6]
+                print(f"  ✓ {sym} 장마감({cutoff:%Y-%m-%d %H:%M}) 후 뉴스 {len(out[sym])}건")
+            except Exception as e:
+                print(f"  [경고] {sym} 뉴스 수집 실패: {e}")
+                out[sym] = []
+        return out
+
+    def _market_close_cutoff(self, last_dt_str: str, market: str) -> datetime:
+        """직전 거래일 장 마감 시각(KST) — 이후 뉴스만 '장 마감 후 뉴스'로 본다.
+        한국(KRX): 거래일 15:30 KST.  미국(NYSE/NASDAQ): 16:00 ET ≈ 익일 06:00 KST."""
+        try:
+            d = datetime.strptime(last_dt_str[:10], "%Y-%m-%d").date()
+        except Exception:
+            d = datetime.now(KST).date()
+        if market == "🇺🇸 미국":
+            return datetime.combine(d, dtime(6, 0), tzinfo=KST) + timedelta(days=1)
+        return datetime.combine(d, dtime(15, 30), tzinfo=KST)
+
+    def _fetch_rss(self, url: str) -> list:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            )
+        })
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read()
+
+        root_el = ET.fromstring(raw)
+        ns = (root_el.tag.split("}")[0] + "}") if root_el.tag.startswith("{") else ""
+        channel = root_el.find(f"{ns}channel") or root_el
+
+        def _text(item, tag):
+            el = item.find(f"{ns}{tag}")
+            return (el.text or "").strip() if el is not None else ""
+
+        items = []
+        for item in channel.findall(f"{ns}item"):
+            pub = _text(item, "pubDate")
+            try:
+                dt   = parsedate_to_datetime(pub).astimezone(KST)
+                disp = dt.strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                dt, disp = None, pub[:16]
+            items.append({
+                "title": _text(item, "title") or "(제목 없음)",
+                "link":  _text(item, "link"),
+                "date":  disp,
+                "dt":    dt,
+            })
+        return items
+
+    # ──────────────────────────────────────────────
+    # 차트
+    # ──────────────────────────────────────────────
+    def _make_line_chart(self, series: dict, path: Path, period_label: str,
+                         color_map: dict, name_map: dict) -> None:
+        """기간 시작=100 으로 리베이스한 종가 추이. 범례 없이 각 선 끝에
+        한글 종목명을 직접 표기한다."""
+        fig, ax = plt.subplots(figsize=(9.6, 4.6), dpi=110)
+        ends = []  # (last_y, name, color)
+        for sym, close in series.items():
+            base = float(close.iloc[0])
+            if not base:
+                continue
+            rebased = close / base * 100
+            color = color_map.get(sym)
+            ax.plot(rebased.index, rebased.values, linewidth=2, color=color)
+            ends.append((float(rebased.values[-1]), name_map.get(sym, sym), color,
+                         rebased.index[-1]))
+
+        ax.axhline(100, color="#999999", linewidth=1, linestyle="--")
+        ax.set_title(f"종가 추이 (기간 시작=100 기준)  ·  {period_label}", fontweight="bold")
+        ax.set_ylabel("리베이스 지수")
+        ax.grid(True, alpha=0.3)
+        # 기간 길이에 따라 연/월/일 눈금 자동 조정 (1주~전체 대응)
+        locator = mdates.AutoDateLocator()
+        ax.xaxis.set_major_locator(locator)
+        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+
+        # 선 끝에 한글 이름 라벨 — 세로 겹침 방지(최소 간격 분산) 후 표기
+        ymin, ymax = ax.get_ylim()
+        min_gap = (ymax - ymin) / 22.0
+        ends.sort(key=lambda e: e[0])          # last_y 오름차순
+        placed_y = []
+        for last_y, *_ in ends:
+            y = last_y
+            if placed_y and y < placed_y[-1] + min_gap:
+                y = placed_y[-1] + min_gap     # 위로 밀어 간격 확보
+            placed_y.append(y)
+        if placed_y:
+            ax.set_ylim(ymin, max(ymax, placed_y[-1] + min_gap))
+
+        xmin, xmax = ax.get_xlim()
+        x_text = xmax + (xmax - xmin) * 0.01   # 축 오른쪽 바깥에 라벨
+        for (last_y, name, color, last_x), y in zip(ends, placed_y):
+            ax.annotate(
+                name,
+                xy=(mdates.date2num(last_x), last_y),  # 선 끝(실제 위치)
+                xytext=(x_text, y),                    # 분산된 라벨 위치
+                textcoords="data", va="center", ha="left",
+                fontsize=8.5, fontweight="bold", color=color,
+                annotation_clip=False,
+                arrowprops=dict(arrowstyle="-", color=color, lw=0.6, alpha=0.5),
+            )
+        # 라벨이 잘리지 않도록 오른쪽 마진 확보
+        fig.subplots_adjust(right=0.80)
+        fig.autofmt_xdate()
+        fig.savefig(path)
+        plt.close(fig)
+
+    def _make_bar_chart(self, rows: list, path: Path, period_label: str,
+                        color_map: dict, name_map: dict) -> None:
+        """종목별 기간 등락률 막대 차트. x축 라벨은 한글 이름만, 사선으로 표기."""
+        fig, ax = plt.subplots(figsize=(9.6, 4.6), dpi=110)
+        syms   = [r["symbol"] for r in rows]
+        labels = [name_map.get(s, s) for s in syms]   # 한글 이름만
+        vals   = [r["period_chg"] for r in rows]
+        colors = [color_map.get(s) for s in syms]      # 라인차트와 동일 색
+        pos    = range(len(syms))
+        bars = ax.bar(pos, vals, color=colors)
+        ax.set_xticks(list(pos))
+        ax.set_xticklabels(labels, fontsize=9, rotation=35, ha="right")
+        ax.axhline(0, color="#1A1A1A", linewidth=1)
+        ax.set_title(f"기간 등락률(%)  ·  {period_label}", fontweight="bold")
+        ax.set_ylabel("등락률 (%)")
+        ax.grid(True, axis="y", alpha=0.3)
+        for bar, v in zip(bars, vals):
+            ax.text(bar.get_x() + bar.get_width() / 2, v,
+                    f"{v:+.1f}%", ha="center",
+                    va="bottom" if v >= 0 else "top", fontsize=9, fontweight="bold")
+        fig.tight_layout()
+        fig.savefig(path)
+        plt.close(fig)
+
+    # ──────────────────────────────────────────────
+    # Gemini 분석
+    # ──────────────────────────────────────────────
+    def _gen_analysis(self, cfg, price_rows, news_map, period_label, market) -> str:
+        model_id = cfg.get("gemini_model", "gemini-3.1-flash-lite")
+        client   = genai.Client(api_key=cfg["gemini_api_key"])
+
+        price_txt = "\n".join(
+            f"- {r['name']}({r['symbol']}): "
+            f"현재 종가 {r['last']:,.0f} (장 최종 {r['last_dt']}), "
+            f"일간 {r['day_chg']:+.2f}%, 기간 {r['period_chg']:+.2f}%, "
+            f"기간고가 {r['high']:,.0f}, 기간저가 {r['low']:,.0f}"
+            for r in price_rows
+        )
+        news_txt = ""
+        for r in price_rows:
+            sym = r["symbol"]
+            heads = news_map.get(sym, [])
+            news_txt += f"\n[{r['name']}({sym}) 뉴스]\n"
+            news_txt += "\n".join(f"  · ({h['date']}) {h['title']}" for h in heads) or "  · (뉴스 없음)"
+            news_txt += "\n"
+
+        sys_inst = """당신은 증권 시황 분석 전문 에디터입니다.
+제공된 가격 데이터와 뉴스 헤드라인을 바탕으로 한국어 시황 분석 리포트를 작성하세요.
+규칙:
+- 본문에 쓰는 모든 가격 수치는 반드시 '종가(close)' 기준으로 작성 (장중가·시가 사용 금지)
+- 종목명은 반드시 제공된 한글 종목명으로 표기 (종목 코드 단독 표기 금지)
+- 반드시 제공된 수치(시작종가, 현재 종가, 등락률 등)를 인용해 근거를 제시
+- 뉴스 헤드라인과 가격 흐름을 연결해 해석
+- 과장·투자 권유 금지, 객관적 사실 기반
+- 마크다운/코드블록 없이 일반 문단 텍스트로만 출력
+- 종목 종합 요약 → 종목별 코멘트 → 유의점 순서, 800~1200자"""
+
+        user = (
+            f"시장: {market}, 분석 기간: {period_label}\n\n"
+            f"[가격 데이터]\n{price_txt}\n\n"
+            f"[뉴스 헤드라인]\n{news_txt}\n\n"
+            "위 데이터를 바탕으로 시황 분석 리포트를 작성해 주세요."
+        )
+        resp = client.models.generate_content(
+            model=model_id,
+            contents=user,
+            config=types.GenerateContentConfig(
+                system_instruction=sys_inst, temperature=0.6,
+            ),
+        )
+        return (resp.text or "(분석 생성 실패)").strip()
+
+    # ──────────────────────────────────────────────
+    # HTML 출력
+    # ──────────────────────────────────────────────
+    def _write_html(self, path, price_rows, news_map, analysis,
+                    line_png, bar_png, period_label, market, now) -> None:
+        esc = html.escape
+
+        def color(v):
+            return "#E63B2E" if v >= 0 else "#0055FF"
+
+        # 당일 시세 카드 (네이버 일간 시세 형식)
+        quote_cards = ""
+        for r in price_rows:
+            base = re.sub(r"\.[A-Z]+$", "", r["symbol"])
+            up   = r["diff"] >= 0
+            arrow = "▲" if up else "▼"
+            c     = color(r["day_chg"])
+            tv_mil = r["trade_value"] / 1e6
+            quote_cards += (
+                "<div class='quote'>"
+                f"<div class='qhead'><b>{esc(r['name'])}</b> "
+                f"<span class='sym'>{esc(base)}</span> "
+                f"<span class='qdate'>{esc(r['last_dt'])} 장마감 기준</span></div>"
+                f"<div class='qprice' style='color:{c}'>{r['last']:,.0f}"
+                f"<span class='qdiff'>전일대비 {arrow} {abs(r['diff']):,.0f} "
+                f"({r['day_chg']:+.2f}%)</span></div>"
+                "<table class='qtable'><tr>"
+                f"<th>전일</th><td class='num'>{r['prev_close']:,.0f}</td>"
+                f"<th>고가</th><td class='num'>{r['day_high']:,.0f}</td>"
+                f"<th>거래량</th><td class='num'>{r['volume']:,}</td></tr><tr>"
+                f"<th>시가</th><td class='num'>{r['day_open']:,.0f}</td>"
+                f"<th>저가</th><td class='num'>{r['day_low']:,.0f}</td>"
+                f"<th>거래대금</th><td class='num'>{tv_mil:,.0f} 백만</td>"
+                "</tr></table></div>"
+            )
+
+        def base_code(sym):
+            return re.sub(r"\.[A-Z]+$", "", sym)
+
+        # 가격 표
+        price_trs = ""
+        for r in price_rows:
+            price_trs += (
+                "<tr>"
+                f"<td><b>{esc(r['name'])}</b><br><span class='sym'>{esc(base_code(r['symbol']))}</span></td>"
+                f"<td class='num'>{r['last']:,.0f}</td>"
+                f"<td class='date'>{esc(r['last_dt'])}</td>"
+                f"<td class='num' style='color:{color(r['day_chg'])}'>{r['day_chg']:+.2f}%</td>"
+                f"<td class='num' style='color:{color(r['period_chg'])}'>{r['period_chg']:+.2f}%</td>"
+                f"<td class='num'>{r['high']:,.0f}</td>"
+                f"<td class='num'>{r['low']:,.0f}</td>"
+                f"<td class='num'>{r['volume']:,}</td>"
+                "</tr>"
+            )
+
+        # 뉴스 표
+        news_trs = ""
+        for r in price_rows:
+            heads = news_map.get(r["symbol"], [])
+            if not heads:
+                news_trs += f"<tr><td><b>{esc(r['name'])}</b></td><td colspan='2'>(뉴스 없음)</td></tr>"
+                continue
+            for i, h in enumerate(heads):
+                first = (
+                    f"<td rowspan='{len(heads)}'><b>{esc(r['name'])}</b><br>"
+                    f"<span class='sym'>{esc(base_code(r['symbol']))}</span></td>"
+                    if i == 0 else ""
+                )
+                link = esc(h["link"])
+                news_trs += (
+                    "<tr>"
+                    f"{first}"
+                    f"<td class='date'>{esc(h['date'])}</td>"
+                    f"<td><a href='{link}' target='_blank'>{esc(h['title'])}</a></td>"
+                    "</tr>"
+                )
+
+        analysis_html = "".join(
+            f"<p>{esc(p.strip())}</p>" for p in analysis.split("\n") if p.strip()
+        )
+
+        doc = f"""<!DOCTYPE html>
+<html lang="ko"><head><meta charset="utf-8">
+<title>주식 뉴스 리포트 {now.strftime('%Y-%m-%d')}</title>
+<style>
+  body {{ font-family:'맑은 고딕','Malgun Gothic',sans-serif; max-width:920px;
+          margin:0 auto; padding:24px; color:#1A1A1A; background:#F5F0E8; }}
+  h1 {{ border-bottom:4px solid #1A1A1A; padding-bottom:8px; }}
+  h2 {{ background:#FFCC00; display:inline-block; padding:4px 12px;
+        border:2px solid #1A1A1A; margin-top:32px; }}
+  table {{ border-collapse:collapse; width:100%; background:#fff;
+           border:3px solid #1A1A1A; margin:12px 0; }}
+  th {{ background:#1A1A1A; color:#fff; padding:8px; font-size:14px; }}
+  td {{ border:1px solid #ccc; padding:8px; font-size:13px; vertical-align:top; }}
+  td.num {{ text-align:right; font-variant-numeric:tabular-nums; }}
+  td.date {{ color:#4A4A4A; white-space:nowrap; }}
+  .sym {{ color:#0055FF; font-size:11px; font-family:Consolas,monospace; }}
+  img {{ width:100%; border:3px solid #1A1A1A; margin:12px 0; background:#fff; }}
+  .meta {{ color:#4A4A4A; font-size:13px; }}
+  a {{ color:#0055FF; text-decoration:none; }}
+  a:hover {{ text-decoration:underline; }}
+  p {{ line-height:1.7; }}
+  .quote {{ background:#fff; border:3px solid #1A1A1A; margin:12px 0; padding:12px 16px; }}
+  .qhead {{ font-size:15px; border-bottom:2px solid #1A1A1A; padding-bottom:6px; }}
+  .qhead .qdate {{ float:right; color:#4A4A4A; font-size:12px; font-weight:normal; }}
+  .qprice {{ font-size:30px; font-weight:bold; margin:8px 0;
+             font-variant-numeric:tabular-nums; }}
+  .qprice .qdiff {{ font-size:14px; margin-left:10px; }}
+  .qtable {{ border:none; margin:0; width:100%; }}
+  .qtable th {{ background:#F5F0E8; color:#1A1A1A; text-align:left;
+                width:80px; font-size:13px; border:1px solid #ddd; }}
+  .qtable td {{ border:1px solid #ddd; }}
+</style></head><body>
+<h1>📈 주식 / ETF 뉴스 리포트</h1>
+<p class="meta">시장: {esc(market)} &nbsp;|&nbsp; 분석 기간: {esc(period_label)}
+&nbsp;|&nbsp; 작성: {now.strftime('%Y-%m-%d %H:%M')} (KST)</p>
+
+<h2>① 당일 시세 <span style="font-size:13px;font-weight:normal;">(KRX 장마감 기준)</span></h2>
+{quote_cards}
+
+<h2>② 가격 요약 <span style="font-size:13px;font-weight:normal;">(현재 종가·기간 고저는 종가/장중 기준)</span></h2>
+<table>
+<tr><th>종목</th><th>현재 종가</th><th>장 최종 일시</th>
+<th>일간</th><th>기간등락</th><th>기간고가</th><th>기간저가</th><th>거래량</th></tr>
+{price_trs}
+</table>
+
+<h2>③ 가격 추이 그래프</h2>
+<img src="charts/{line_png.name}" alt="가격 추이">
+<img src="charts/{bar_png.name}" alt="기간 등락률">
+
+<h2>④ 종목별 뉴스</h2>
+<table>
+<tr><th>종목</th><th>날짜</th><th>헤드라인</th></tr>
+{news_trs}
+</table>
+
+<h2>⑤ 종합 분석 (Gemini)</h2>
+{analysis_html}
+
+<p class="meta" style="margin-top:32px;">
+※ 데이터 출처: Yahoo Finance(yfinance), 구글 뉴스 RSS.
+본 리포트는 정보 제공용이며 투자 권유가 아닙니다.</p>
+</body></html>"""
+
+        path.write_text(doc, encoding="utf-8")
