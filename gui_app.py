@@ -39,6 +39,16 @@ try:
 except ImportError:
     StockReportSection = None  # yfinance/matplotlib 미설치 시 탭 비활성
 
+try:
+    from industry_section import IndustrySectorSection
+except ImportError:
+    IndustrySectorSection = None
+
+try:
+    from investor_trade_section import InvestorTradeSection
+except ImportError:
+    InvestorTradeSection = None
+
 # ── Gemini 모델 목록 (표시명 → API ID) ──────────────────────────────
 GEMINI_MODELS = [
     ("Gemini 3.1 Flash Lite", "gemini-3.1-flash-lite"),
@@ -320,6 +330,18 @@ class NaverPosterGUI:
 
         self.stock_section = StockReportSection(self.root, self._theme_dict())
         self.stock_section.build(container)
+
+        if IndustrySectorSection is not None:
+            self.industry_section = IndustrySectorSection(
+                self.root, self._theme_dict(), self.stock_section
+            )
+            self.industry_section.build(container)
+
+        if InvestorTradeSection is not None:
+            self.investor_section = InvestorTradeSection(
+                self.root, self._theme_dict(), self.stock_section
+            )
+            self.investor_section.build(container)
 
         # 공용 로그 안내
         tk.Label(

@@ -58,12 +58,44 @@ MARKET_PRESETS = {
     "🇺🇸 미국": ("en-US", "US", "US:en"),
 }
 
-# 차트 공통 색상 팔레트 (가격추이·등락률 그래프에서 종목별 동일 색 사용)
-PALETTE = ["#0055FF", "#E63B2E", "#16A085", "#FF8C00",
-           "#8E44AD", "#1A1A1A", "#00A86B", "#C0392B"]
+# 차트 공통 색상 팔레트 — 12색, 색상환을 고르게 분산해 인접 종목 구별 용이
+PALETTE = [
+    "#D62728",  # [0] vivid red        (warm)
+    "#1969CF",  # [1] vivid blue       (cool)  comp-red
+    "#2CA02C",  # [2] vivid green      (cool)
+    "#FF6B00",  # [3] vivid orange     (warm)  comp-blue
+    "#8B00D4",  # [4] vivid violet     (cool)  comp-orange
+    "#00A67E",  # [5] vivid teal       (cool)  comp-violet
+    "#E8005A",  # [6] vivid hot-pink   (warm)  comp-teal
+    "#00A8CC",  # [7] vivid cyan       (cool)  comp-pink
+    "#CC8800",  # [8] dark amber       (warm)  comp-cyan
+    "#5B3CC4",  # [9] vivid indigo     (cool)  comp-amber
+    "#3CB62A",  # [10] vivid lime      (warm)
+    "#0055AA",  # [11] deep navy       (cool)  comp-lime
+]
 
 # 한국 종목명·거래소 실시간 조회 (네이버 증권 모바일 API)
 NAVER_STOCK_API = "https://m.stock.naver.com/api/stock/{code}/basic"
+
+
+def _get_desktop() -> Path:
+    """어떤 Windows PC에서도 실제 바탕화면 폴더를 반환 (OneDrive 동기화 대응)."""
+    try:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
+        ) as k:
+            return Path(winreg.QueryValueEx(k, "Desktop")[0])
+    except Exception:
+        pass
+    for candidate in [
+        Path.home() / "OneDrive" / "Desktop",
+        Path.home() / "Desktop",
+    ]:
+        if candidate.exists():
+            return candidate
+    return Path.home() / "Desktop"
 
 
 class StockReportSection:
@@ -229,7 +261,8 @@ class StockReportSection:
             # 3) 차트 생성
             self._set_status("그래프 생성 중...")
             now = datetime.now(KST)
-            charts_dir = Path.home() / "Desktop" / "lists" / "charts"
+            desktop    = _get_desktop()
+            charts_dir = desktop / "lists" / "charts"
             charts_dir.mkdir(parents=True, exist_ok=True)
             stamp = now.strftime("%Y-%m-%d_%H-%M")
             line_png = charts_dir / f"price_{stamp}.png"
@@ -244,6 +277,15 @@ class StockReportSection:
             self._make_line_chart(price_series, line_png, period_label, color_map, name_map)
             self._make_bar_chart(price_rows, bar_png, period_label, color_map, name_map)
 
+            # 3-1) 시장 지수 스냅샷
+            self._set_status("시장 지수 데이터 수집 중...")
+            try:
+                index_data = self._collect_market_data(market)
+                print("  ✓ 시장 지수 완료")
+            except Exception as _me:
+                index_data = []
+                print(f"  [경고] 시장 지수 생략: {_me}")
+
             # 4) Gemini 분석
             self._set_status("Gemini 종합 분석 중...")
             analysis = self._gen_analysis(
@@ -252,13 +294,13 @@ class StockReportSection:
 
             # 5) HTML 리포트 저장 (파일명에 한글 종목명 포함)
             self._set_status("HTML 리포트 저장 중...")
-            lists_dir = Path.home() / "Desktop" / "lists"
+            lists_dir = desktop / "lists"
             lists_dir.mkdir(parents=True, exist_ok=True)
             names_label = self._filename_names(price_rows)
             html_path = lists_dir / f"{stamp} 주식리포트 {names_label}.html"
             self._write_html(
                 html_path, price_rows, news_map, analysis,
-                line_png, bar_png, period_label, market, now,
+                line_png, bar_png, index_data, period_label, market, now,
             )
 
             fp = str(html_path)
@@ -407,23 +449,28 @@ class StockReportSection:
                 day_low  = float(hist["Low"].iloc[-1])  if "Low"  in hist else last
 
                 name = self._ticker_name(tk_obj, sym)
+                try:
+                    mktcap = int(getattr(tk_obj.fast_info, "market_cap", 0) or 0)
+                except Exception:
+                    mktcap = 0
                 rows.append({
                     "symbol":      sym,
                     "name":        name,
-                    "last":        last,             # 현재(기간 최종) 종가
-                    "last_dt":     self._fmt_dt(close.index[-1], market),  # 장 최종 일시(장 마감 시간)
+                    "last":        last,
+                    "last_dt":     self._fmt_dt(close.index[-1], market),
                     "day_chg":     day_chg,
                     "period_chg":  period_chg,
-                    "high":        high,             # 기간 고가
-                    "low":         low,              # 기간 저가
+                    "high":        high,
+                    "low":         low,
                     "volume":      volume,
+                    "mktcap":      mktcap,
                     # 당일 시세 스냅샷
                     "prev_close":  prev,
-                    "diff":        last - prev,       # 전일대비 (금액)
+                    "diff":        last - prev,
                     "day_open":    day_open,
                     "day_high":    day_high,
                     "day_low":     day_low,
-                    "trade_value": volume * last,     # 거래대금(근사: 거래량×종가)
+                    "trade_value": volume * last,
                 })
                 series[sym] = close
                 print(f"  ✓ {sym} ({name}): 종가 {last:,.2f}  기간 {period_chg:+.2f}%")
@@ -528,61 +575,161 @@ class StockReportSection:
         return items
 
     # ──────────────────────────────────────────────
+    # 시장 지수 개요
+    # ──────────────────────────────────────────────
+    def _collect_market_data(self, market: str = "🇰🇷 한국"):
+        """시장에 따라 주요 지수 스냅샷 → [{name, last, diff, pct}, ...]."""
+        if market == "🇺🇸 미국":
+            idx_cfg = [
+                ("다우산업",   "^DJI"),
+                ("나스닥종합", "^IXIC"),
+                ("S&P 500",   "^GSPC"),
+            ]
+        else:
+            idx_cfg = [
+                ("코스피",    "^KS11"),
+                ("코스닥",    "^KQ11"),
+                ("코스피200", "^KS200"),
+            ]
+        index_data = []
+        for name, sym in idx_cfg:
+            try:
+                h = yf.Ticker(sym).history(period="5d", interval="1d", auto_adjust=False)
+                if h is not None and len(h) >= 2:
+                    prev = float(h["Close"].iloc[-2])
+                    last = float(h["Close"].iloc[-1])
+                    diff = last - prev
+                    pct  = (diff / prev * 100) if prev else 0
+                    index_data.append({"name": name, "last": last, "diff": diff, "pct": pct})
+            except Exception as e:
+                print(f"  [경고] {name} 지수: {e}")
+        return index_data
+
+    # ──────────────────────────────────────────────
     # 차트
     # ──────────────────────────────────────────────
     def _make_line_chart(self, series: dict, path: Path, period_label: str,
                          color_map: dict, name_map: dict) -> None:
-        """기간 시작=100 으로 리베이스한 종가 추이. 범례 없이 각 선 끝에
-        한글 종목명을 직접 표기한다."""
+        """기간 시작=100 으로 리베이스한 종가 추이. 라벨은 차트 내부 우측에 표기."""
+        import matplotlib.ticker as mticker
+
+        class _KoDateFmt(mticker.Formatter):
+            """틱 간격에 따라 한국어 날짜 자동 선택 (연/월/월일)."""
+            def __call__(self, x, pos=None):
+                try:
+                    dt = mdates.num2date(x)
+                    ticks = self.axis.get_ticklocs()
+                    span = (ticks[-1] - ticks[0]) if len(ticks) > 1 else 1000
+                    if span > 500:            # 1년 초과: 연도 + 월
+                        return f"{dt.year}년\n{dt.month}월"
+                    elif span > 150:          # 5개월 초과: 월만
+                        return f"{dt.month}월"
+                    else:                     # 5개월 이하: 월/일 (중복 방지)
+                        return f"{dt.month}/{dt.day}"
+                except Exception:
+                    return ""
+
+        import numpy as np
+
+        def _cubic_smooth(x: np.ndarray, y: np.ndarray, n_out: int = 400):
+            """가우시안 사전 스무딩 후 자연 3차 스플라인. 과도한 진동을 억제."""
+            n = len(x)
+            if n < 4:
+                return x, y
+            # 가우시안 스무딩 (sigma = 데이터 길이/15, 최소 2) — 값이 클수록 곡선 완만
+            sigma  = max(2.0, n / 15.0)
+            radius = int(sigma * 3)
+            kk = np.exp(-0.5 * (np.arange(-radius, radius + 1) / sigma) ** 2)
+            kk /= kk.sum()
+            y_sm = np.convolve(np.pad(y, radius, mode="edge"), kk, mode="valid")
+            # 스무딩된 데이터로 자연 3차 스플라인
+            h = np.diff(x).astype(float)
+            A = np.zeros((n, n))
+            b = np.zeros(n)
+            A[0, 0] = A[-1, -1] = 1.0
+            for i in range(1, n - 1):
+                A[i, i-1] = h[i-1]
+                A[i, i]   = 2.0 * (h[i-1] + h[i])
+                A[i, i+1] = h[i]
+                b[i] = 6.0 * ((y_sm[i+1]-y_sm[i])/h[i] - (y_sm[i]-y_sm[i-1])/h[i-1])
+            M = np.linalg.solve(A, b)
+            x_fine = np.linspace(x[0], x[-1], n_out)
+            y_fine = np.empty(n_out)
+            for ki, xi in enumerate(x_fine):
+                i  = min(int(np.searchsorted(x, xi, side="right")) - 1, n - 2)
+                t  = xi - x[i]
+                hi = h[i]
+                y_fine[ki] = (
+                    (M[i+1] - M[i]) / (6*hi) * t**3
+                    + M[i] / 2 * t**2
+                    + ((y_sm[i+1]-y_sm[i])/hi - hi*(2*M[i]+M[i+1])/6) * t
+                    + y_sm[i]
+                )
+            return x_fine, y_fine
+
         fig, ax = plt.subplots(figsize=(9.6, 4.6), dpi=110)
-        ends = []  # (last_y, name, color)
+        ends = []
         for sym, close in series.items():
             base = float(close.iloc[0])
             if not base:
                 continue
             rebased = close / base * 100
             color = color_map.get(sym)
-            ax.plot(rebased.index, rebased.values, linewidth=2, color=color)
-            ends.append((float(rebased.values[-1]), name_map.get(sym, sym), color,
-                         rebased.index[-1]))
+            x_num = np.array(mdates.date2num(close.index.to_pydatetime()))
+            y_vals = rebased.values.astype(float)
+            x_s, y_s = _cubic_smooth(x_num, y_vals)
+            ax.plot(x_s, y_s, linewidth=1.3, color=color)
+            ends.append((float(y_vals[-1]), name_map.get(sym, sym), color,
+                         close.index[-1]))
 
         ax.axhline(100, color="#999999", linewidth=1, linestyle="--")
         ax.set_title(f"종가 추이 (기간 시작=100 기준)  ·  {period_label}", fontweight="bold")
         ax.set_ylabel("리베이스 지수")
+        ax.tick_params(axis="both", labelsize=9)
         ax.grid(True, alpha=0.3)
-        # 기간 길이에 따라 연/월/일 눈금 자동 조정 (1주~전체 대응)
-        locator = mdates.AutoDateLocator()
-        ax.xaxis.set_major_locator(locator)
-        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
 
-        # 선 끝에 한글 이름 라벨 — 세로 겹침 방지(최소 간격 분산) 후 표기
+        locator = mdates.AutoDateLocator(minticks=5, maxticks=10)
+        ax.xaxis.set_major_locator(locator)
+        ax.xaxis.set_major_formatter(_KoDateFmt())
+
+        # 선 끝 라벨 — 차트 내부 우측에 세로 분산, 둥근 테두리 박스
         ymin, ymax = ax.get_ylim()
-        min_gap = (ymax - ymin) / 22.0
-        ends.sort(key=lambda e: e[0])          # last_y 오름차순
+        min_gap = (ymax - ymin) / 16.0
+        ends.sort(key=lambda e: e[0])
         placed_y = []
         for last_y, *_ in ends:
             y = last_y
             if placed_y and y < placed_y[-1] + min_gap:
-                y = placed_y[-1] + min_gap     # 위로 밀어 간격 확보
+                y = placed_y[-1] + min_gap
             placed_y.append(y)
         if placed_y:
             ax.set_ylim(ymin, max(ymax, placed_y[-1] + min_gap))
 
-        xmin, xmax = ax.get_xlim()
-        x_text = xmax + (xmax - xmin) * 0.01   # 축 오른쪽 바깥에 라벨
+        # x축 우측 23% 연장 → 선은 원래 끝에서 멈추고
+        # 라벨은 연장 영역 안에서 오른쪽 정렬
+        xmin, xmax_data = ax.get_xlim()
+        x_span = xmax_data - xmin
+        fixed_ticks = [t for t in ax.get_xticks() if xmin <= t <= xmax_data]
+        ax.set_xlim(xmin, xmax_data + x_span * 0.09)
+        ax.set_xticks(fixed_ticks)   # 연장 영역에 새 눈금 방지
+
+        # 모든 라벨의 오른쪽 끝을 동일한 x에 맞춰 우정렬
+        x_text = xmax_data + x_span * 0.085
+
         for (last_y, name, color, last_x), y in zip(ends, placed_y):
             ax.annotate(
                 name,
-                xy=(mdates.date2num(last_x), last_y),  # 선 끝(실제 위치)
-                xytext=(x_text, y),                    # 분산된 라벨 위치
-                textcoords="data", va="center", ha="left",
-                fontsize=8.5, fontweight="bold", color=color,
+                xy=(mdates.date2num(last_x), last_y),
+                xytext=(x_text, y),
+                textcoords="data", va="center", ha="right",
+                fontsize=8, fontweight="bold", color=color,
                 annotation_clip=False,
-                arrowprops=dict(arrowstyle="-", color=color, lw=0.6, alpha=0.5),
+                arrowprops=dict(arrowstyle="-", color=color, lw=0.6, alpha=0.4),
+                bbox=dict(boxstyle="round,pad=0.28", facecolor="white",
+                          edgecolor=color, linewidth=1.3, alpha=0.90),
             )
-        # 라벨이 잘리지 않도록 오른쪽 마진 확보
-        fig.subplots_adjust(right=0.80)
-        fig.autofmt_xdate()
+
+        fig.tight_layout()
         fig.savefig(path)
         plt.close(fig)
 
@@ -662,40 +809,81 @@ class StockReportSection:
     # HTML 출력
     # ──────────────────────────────────────────────
     def _write_html(self, path, price_rows, news_map, analysis,
-                    line_png, bar_png, period_label, market, now) -> None:
+                    line_png, bar_png, index_data, period_label, market, now) -> None:
         esc = html.escape
 
         def color(v):
             return "#E63B2E" if v >= 0 else "#0055FF"
 
-        # 당일 시세 카드 (네이버 일간 시세 형식)
-        quote_cards = ""
+        # 가격 포맷: 미국 소수점 2자리, 한국 정수
+        _us = (market == "🇺🇸 미국")
+        def pfmt(v): return f"{v:,.2f}" if _us else f"{v:,.0f}"
+
+        def capfmt(v: int) -> str:
+            if v <= 0: return "-"
+            if _us:
+                if v >= 1e12: return f"${v/1e12:.1f}T"
+                if v >= 1e9:  return f"${v/1e9:.1f}B"
+                return f"${v/1e6:.0f}M"
+            else:
+                if v >= 1e12: return f"{v/1e12:.1f}조"
+                if v >= 1e8:  return f"{v/1e8:.0f}억"
+                return f"{v:,}"
+
+        # 당일 시세 표 (전체 종목 한 테이블)
+        quote_trs = ""
         for r in price_rows:
-            base = re.sub(r"\.[A-Z]+$", "", r["symbol"])
-            up   = r["diff"] >= 0
-            arrow = "▲" if up else "▼"
-            c     = color(r["day_chg"])
+            base   = re.sub(r"\.[A-Z]+$", "", r["symbol"])
+            up     = r["diff"] >= 0
+            arrow  = "▲" if up else "▼"
+            c      = color(r["day_chg"])
             tv_mil = r["trade_value"] / 1e6
-            quote_cards += (
-                "<div class='quote'>"
-                f"<div class='qhead'><b>{esc(r['name'])}</b> "
-                f"<span class='sym'>{esc(base)}</span> "
-                f"<span class='qdate'>{esc(r['last_dt'])} 장마감 기준</span></div>"
-                f"<div class='qprice' style='color:{c}'>{r['last']:,.0f}"
-                f"<span class='qdiff'>전일대비 {arrow} {abs(r['diff']):,.0f} "
-                f"({r['day_chg']:+.2f}%)</span></div>"
-                "<table class='qtable'><tr>"
-                f"<th>전일</th><td class='num'>{r['prev_close']:,.0f}</td>"
-                f"<th>고가</th><td class='num'>{r['day_high']:,.0f}</td>"
-                f"<th>거래량</th><td class='num'>{r['volume']:,}</td></tr><tr>"
-                f"<th>시가</th><td class='num'>{r['day_open']:,.0f}</td>"
-                f"<th>저가</th><td class='num'>{r['day_low']:,.0f}</td>"
-                f"<th>거래대금</th><td class='num'>{tv_mil:,.0f} 백만</td>"
-                "</tr></table></div>"
+            quote_trs += (
+                "<tr>"
+                f"<td><b>{esc(r['name'])}</b><br><span class='sym'>{esc(base)}</span></td>"
+                f"<td class='num'>{capfmt(r['mktcap'])}</td>"
+                f"<td class='num'>{pfmt(r['prev_close'])}</td>"
+                f"<td class='num' style='color:{c}'>{pfmt(r['last'])}<br>"
+                f"<span style='font-size:12px'>{arrow} {pfmt(abs(r['diff']))} ({r['day_chg']:+.2f}%)</span></td>"
+                f"<td class='num'>{r['volume']:,}</td>"
+                f"<td class='num'>{pfmt(tv_mil)} 백만</td>"
+                "</tr>"
             )
+        quote_cards = (
+            "<table>"
+            "<tr><th>종목</th><th>시총</th><th>전일</th><th>종가</th><th>거래량</th><th>거래대금</th></tr>"
+            f"{quote_trs}"
+            "</table>"
+        )
+
+        # 시장 지수 박스 (코스피·코스닥·코스피200)
+        idx_boxes_html = ""
+        if index_data:
+            boxes = ""
+            for i, idx in enumerate(index_data[:3]):
+                is_dark = (i == 0)
+                bg  = "#1A1A1A" if is_dark else "#FFFFFF"
+                nc  = "#AAAAAA" if is_dark else "#666666"
+                up  = idx["diff"] >= 0
+                vc  = ("#FF5555" if up else "#5599FF") if is_dark else ("#E63B2E" if up else "#0055FF")
+                arrow = "▲" if up else "▼"
+                boxes += (
+                    f"<div style='flex:1; padding:14px 18px; background:{bg};"
+                    f" border:2px solid #CCCCCC; border-radius:4px;'>"
+                    f"<div style='font-size:12px; color:{nc}; margin-bottom:6px;'>{esc(idx['name'])}</div>"
+                    f"<div style='font-size:22px; font-weight:bold; color:{vc};"
+                    f" font-variant-numeric:tabular-nums;'>{idx['last']:,.2f}</div>"
+                    f"<div style='font-size:12px; color:{vc}; margin-top:4px;'>"
+                    f"{arrow} {abs(idx['diff']):,.2f} &nbsp; {idx['pct']:+.2f}%</div>"
+                    f"</div>"
+                )
+            idx_boxes_html = f"<div style='display:flex; gap:8px; margin:12px 0;'>{boxes}</div>"
 
         def base_code(sym):
             return re.sub(r"\.[A-Z]+$", "", sym)
+
+        # 장 최종 일시 (헤더 아래 표시용)
+        last_dt_label = price_rows[0]["last_dt"] if price_rows else ""
 
         # 가격 표
         price_trs = ""
@@ -703,12 +891,11 @@ class StockReportSection:
             price_trs += (
                 "<tr>"
                 f"<td><b>{esc(r['name'])}</b><br><span class='sym'>{esc(base_code(r['symbol']))}</span></td>"
-                f"<td class='num'>{r['last']:,.0f}</td>"
-                f"<td class='date'>{esc(r['last_dt'])}</td>"
+                f"<td class='num'>{pfmt(r['last'])}</td>"
                 f"<td class='num' style='color:{color(r['day_chg'])}'>{r['day_chg']:+.2f}%</td>"
                 f"<td class='num' style='color:{color(r['period_chg'])}'>{r['period_chg']:+.2f}%</td>"
-                f"<td class='num'>{r['high']:,.0f}</td>"
-                f"<td class='num'>{r['low']:,.0f}</td>"
+                f"<td class='num'>{pfmt(r['high'])}</td>"
+                f"<td class='num'>{pfmt(r['low'])}</td>"
                 f"<td class='num'>{r['volume']:,}</td>"
                 "</tr>"
             )
@@ -775,17 +962,18 @@ class StockReportSection:
 <p class="meta">시장: {esc(market)} &nbsp;|&nbsp; 분석 기간: {esc(period_label)}
 &nbsp;|&nbsp; 작성: {now.strftime('%Y-%m-%d %H:%M')} (KST)</p>
 
-<h2>① 당일 시세 <span style="font-size:13px;font-weight:normal;">(KRX 장마감 기준)</span></h2>
+<h2>① 당일 시세 <span style="font-size:13px;font-weight:normal;">({'NYSE 장마감 기준' if market == '🇺🇸 미국' else 'KRX 장마감 기준'})</span></h2>
+{idx_boxes_html}
 {quote_cards}
 
-<h2>② 가격 요약 <span style="font-size:13px;font-weight:normal;">(현재 종가·기간 고저는 종가/장중 기준)</span></h2>
+<h2>② 가격 요약  분석 기간: {esc(period_label)}</h2>
+<p style="font-size:14px; font-weight:bold; color:#1A1A1A; margin:6px 0 10px 0;">장 최종 일시: {esc(last_dt_label)}</p>
 <table>
-<tr><th>종목</th><th>현재 종가</th><th>장 최종 일시</th>
-<th>일간</th><th>기간등락</th><th>기간고가</th><th>기간저가</th><th>거래량</th></tr>
+<tr><th>종목</th><th>현재 종가</th><th>일간</th><th>기간등락</th><th>기간고가</th><th>기간저가</th><th>거래량</th></tr>
 {price_trs}
 </table>
 
-<h2>③ 가격 추이 그래프</h2>
+<h2>③ 추이 그래프</h2>
 <img src="charts/{line_png.name}" alt="가격 추이">
 <img src="charts/{bar_png.name}" alt="기간 등락률">
 
@@ -795,7 +983,7 @@ class StockReportSection:
 {news_trs}
 </table>
 
-<h2>⑤ 종합 분석 (Gemini)</h2>
+<h2>⑤ 종합 분석</h2>
 {analysis_html}
 
 <p class="meta" style="margin-top:32px;">
