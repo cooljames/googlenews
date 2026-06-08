@@ -653,11 +653,22 @@ class NewsAnalyzerSection:
 
         sections = ""
         for sub_title, analysis in analyses:
-            paras = "".join(
-                f"<p>{esc(p.strip())}</p>"
-                for p in str(analysis).split("\n") if p.strip()
-            )
-            sections += f"<h2>{esc(sub_title)}</h2>\n{paras}\n"
+            clean_sub = re.sub(r'[#\*\_]+', '', str(sub_title)).strip()
+            paras = ""
+            for p in str(analysis).split("\n"):
+                p_clean = p.strip()
+                if not p_clean:
+                    continue
+                if p_clean.startswith('#'):
+                    p_clean = re.sub(r'^#+\s*', '', p_clean)
+                    p_clean = re.sub(r'[#\*\_]+', '', p_clean).strip()
+                    paras += f"<h3>{html.escape(p_clean)}</h3>"
+                else:
+                    p_html = html.escape(p_clean)
+                    p_html = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', p_html)
+                    p_html = re.sub(r'\*(.*?)\*', r'<i>\1</i>', p_html)
+                    paras += f"<p>{p_html}</p>"
+            sections += f"<h2>{esc(clean_sub)}</h2>\n{paras}\n"
 
         sources = "".join(
             f"<li>{esc(a['title'])} "
@@ -674,8 +685,9 @@ class NewsAnalyzerSection:
           margin:0 auto; padding:24px; color:#1A1A1A; background:#F5F0E8;
           line-height:1.75; }}
   h1 {{ border-bottom:4px solid #1A1A1A; padding-bottom:10px; }}
-  h2 {{ background:#FFCC00; display:inline-block; padding:4px 12px;
-        border:2px solid #1A1A1A; margin-top:30px; font-size:18px; }}
+  h2 {{ background:#FFCC00; display:inline-block; padding:5px 14px;
+        border:2px solid #1A1A1A; margin-top:30px; font-size:20px; font-weight:bold; }}
+  h3 {{ font-size:16px; font-weight:bold; margin-top:16px; margin-bottom:6px; }}
   p {{ margin:10px 0; }}
   .meta {{ color:#4A4A4A; font-size:13px; }}
   .box {{ background:#fff; border:3px solid #1A1A1A; padding:14px 18px; margin-top:24px; }}

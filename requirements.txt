@@ -6,3 +6,4 @@ matplotlib            # 가격 추이·등락률 그래프 생성
 pandas
 streamlit
 pykrx
+openpyxl              # 업종별 종목 엑셀(.xlsx) 저장

@@ -152,9 +152,11 @@ def _fetch_ranking(mkt_id: str, investor_code: str, period_days: int) -> list:
 class InvestorTradeSection:
     """기관별 매매 동향 탐색 섹션. build(container) 로 UI 구성."""
 
-    def __init__(self, root: tk.Tk, theme: dict, report_section):
+    def __init__(self, root: tk.Tk, theme: dict, report_section, main_notebook=None, sub_notebook=None):
         self.root           = root
         self.report_section = report_section
+        self.main_notebook  = main_notebook
+        self.sub_notebook   = sub_notebook
         self.bg_card        = theme["bg_card"]
         self.bg_input       = theme["bg_input"]
         self.text_light     = theme["text_light"]
@@ -417,4 +419,9 @@ class InvestorTradeSection:
         self.report_section.ticker_entry.delete(0, "end")
         self.report_section.ticker_entry.insert(0, ", ".join(tickers))
         self.report_section.market_var.set("🇰🇷 한국")
+
+        # 메인 탭 전환 (Stock Report는 인덱스 2)
+        if self.main_notebook:
+            self.main_notebook.select(2)
+
         self.report_section.start_report_thread()

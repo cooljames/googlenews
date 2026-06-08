@@ -144,10 +144,12 @@ class StockReportSection:
         tk.Label(opt_row, text="시장:", font=("맑은 고딕", 9, "bold"),
                  bg=self.bg_card, fg=self.text_dark).pack(side="left", padx=(0, 4))
         self.market_var = tk.StringVar(value="🇰🇷 한국")
-        ttk.Combobox(opt_row, textvariable=self.market_var,
+        self.market_cb = ttk.Combobox(opt_row, textvariable=self.market_var,
                      values=list(MARKET_PRESETS.keys()),
                      state="readonly", width=9, font=("맑은 고딕", 9)
-                     ).pack(side="left", padx=(0, 10))
+                     )
+        self.market_cb.pack(side="left", padx=(0, 10))
+        self.market_cb.bind("<<ComboboxSelected>>", self._on_market_change)
 
         tk.Label(opt_row, text="기간:", font=("맑은 고딕", 9, "bold"),
                  bg=self.bg_card, fg=self.text_dark).pack(side="left", padx=(0, 4))
@@ -155,6 +157,14 @@ class StockReportSection:
         ttk.Combobox(opt_row, textvariable=self.period_var,
                      values=list(PERIOD_PRESETS.keys()),
                      state="readonly", width=8, font=("맑은 고딕", 9)
+                     ).pack(side="left")
+
+        tk.Label(opt_row, text="뉴스 필터:", font=("맑은 고딕", 9, "bold"),
+                 bg=self.bg_card, fg=self.text_dark).pack(side="left", padx=(10, 4))
+        self.news_filter_var = tk.StringVar(value="장후")
+        ttk.Combobox(opt_row, textvariable=self.news_filter_var,
+                     values=["장전", "장중", "장후", "실시간(1시간 이내)", "6시간", "12시간", "24시간"],
+                     state="readonly", width=16, font=("맑은 고딕", 9)
                      ).pack(side="left")
 
         # 티커 입력
@@ -209,6 +219,7 @@ class StockReportSection:
         self.open_btn.bind("<Enter>", lambda e: self._hover(e, self.accent))
         self.open_btn.bind("<Leave>", lambda e: self._hover(e, self.primary))
         self.last_html_path: str = ""
+        self._on_market_change()
 
     def _hover(self, event, color: str) -> None:
         if event.widget["state"] != "disabled":
@@ -289,7 +300,7 @@ class StockReportSection:
             # 4) Gemini 분석
             self._set_status("Gemini 종합 분석 중...")
             analysis = self._gen_analysis(
-                cfg, price_rows, news_map, period_label, market
+                cfg, price_rows, news_map, period_label, market, self.news_filter_var.get()
             )
 
             # 5) HTML 리포트 저장 (파일명에 한글 종목명 포함)
@@ -301,6 +312,7 @@ class StockReportSection:
             self._write_html(
                 html_path, price_rows, news_map, analysis,
                 line_png, bar_png, index_data, period_label, market, now,
+                self.news_filter_var.get()
             )
 
             fp = str(html_path)
@@ -432,21 +444,57 @@ class StockReportSection:
                 if close.empty:
                     continue
 
-                first = float(close.iloc[0])
-                last  = float(close.iloc[-1])
-                prev  = float(close.iloc[-2]) if len(close) >= 2 else first
+                # 장중 실시간 가격 데이터 가져오기
+                live_price = None
+                live_volume = None
+                try:
+                    if self._is_market_active(market):
+                        fast = tk_obj.fast_info
+                        if fast and hasattr(fast, "last_price") and fast.last_price:
+                            live_price = float(fast.last_price)
+                        if fast and hasattr(fast, "last_volume") and fast.last_volume:
+                            live_volume = int(fast.last_volume)
+                except Exception:
+                    pass
+
+                close_list = list(close.values)
+                if live_price is not None:
+                    close_list[-1] = live_price
+                    close.iloc[-1] = live_price
+
+                first = float(close_list[0])
+                last  = float(close_list[-1])
+                prev  = float(close_list[-2]) if len(close_list) >= 2 else first
+
+                try:
+                    if self._is_market_active(market):
+                        fast = tk_obj.fast_info
+                        if fast and hasattr(fast, "previous_close") and fast.previous_close:
+                            prev = float(fast.previous_close)
+                except Exception:
+                    pass
+
                 day_chg    = (last / prev - 1) * 100 if prev else 0.0
                 period_chg = (last / first - 1) * 100 if first else 0.0
+                
                 volume = int(hist["Volume"].iloc[-1]) if "Volume" in hist else 0
+                if live_volume is not None:
+                    volume = live_volume
 
                 # 기간 고가/저가는 장중 High/Low 기준 (실제 최고·최저가)
                 high = float(hist["High"].max()) if "High" in hist else last
                 low  = float(hist["Low"].min())  if "Low"  in hist else last
+                if live_price is not None:
+                    high = max(high, live_price)
+                    low = min(low, live_price)
 
                 # 당일 시세 (네이버 일간 시세 형식)
                 day_open = float(hist["Open"].iloc[-1]) if "Open" in hist else last
                 day_high = float(hist["High"].iloc[-1]) if "High" in hist else last
                 day_low  = float(hist["Low"].iloc[-1])  if "Low"  in hist else last
+                if live_price is not None:
+                    day_high = max(day_high, live_price)
+                    day_low = min(day_low, live_price)
 
                 name = self._ticker_name(tk_obj, sym)
                 try:
@@ -490,9 +538,36 @@ class StockReportSection:
         except Exception:
             return sym
 
+    def _is_market_active(self, market: str) -> bool:
+        now_kst = datetime.now(KST)
+        is_weekday = now_kst.weekday() < 5
+        if not is_weekday:
+            return False
+            
+        if market == "🇰🇷 한국":
+            return dtime(9, 0) <= now_kst.time() <= dtime(15, 30)
+        elif market == "🇺🇸 미국":
+            now_et = self._kst_to_et(now_kst)
+            if now_et.weekday() >= 5:
+                return False
+            return dtime(9, 30) <= now_et.time() <= dtime(16, 0)
+        return False
+
+    def _on_market_change(self, event=None):
+        market = self.market_var.get()
+        is_active = self._is_market_active(market)
+        self.news_filter_var.set("장중" if is_active else "장후")
+
     def _fmt_dt(self, ts, market: str = "🇰🇷 한국") -> str:
-        """최종 거래일 + 장 마감 시간으로 표기.
-        한국(KRX) 15:30, 미국(NYSE/NASDAQ) 16:00 (각 시장 현지 마감)."""
+        """최종 거래일 + 시간으로 표기.
+        장중(실시간)이면 현재 시각으로 표기하고, 그 외에는 장 마감 시간으로 표기."""
+        now_kst = datetime.now(KST)
+        if self._is_market_active(market):
+            if market == "🇺🇸 미국":
+                now_et = self._kst_to_et(now_kst)
+                return now_et.strftime("%Y-%m-%d %H:%M") + " (ET)"
+            else:
+                return now_kst.strftime("%Y-%m-%d %H:%M") + " (KST)"
         try:
             d = ts.strftime("%Y-%m-%d")
         except Exception:
@@ -500,14 +575,85 @@ class StockReportSection:
         close_time = "16:00" if market == "🇺🇸 미국" else "15:30"
         return f"{d} {close_time}"
 
+    def _kst_to_et(self, dt_kst: datetime) -> datetime:
+        from datetime import date
+        dt_utc = dt_kst.astimezone(timezone.utc)
+        y, m, d = dt_utc.year, dt_utc.month, dt_utc.day
+        is_dst = False
+        if 4 <= m <= 10:
+            is_dst = True
+        elif m == 3:
+            first_day_w = date(y, 3, 1).weekday()
+            first_sun = 1 + (6 - first_day_w) % 7
+            second_sun = first_sun + 7
+            if d > second_sun or (d == second_sun and dt_utc.hour >= 7):
+                is_dst = True
+        elif m == 11:
+            first_day_w = date(y, 11, 1).weekday()
+            first_sun = 1 + (6 - first_day_w) % 7
+            if d < first_sun or (d == first_sun and dt_utc.hour < 6):
+                is_dst = True
+                
+        offset = timedelta(hours=-4) if is_dst else timedelta(hours=-5)
+        return (dt_utc + offset).replace(tzinfo=None)
+
+    def _is_in_filter(self, dt: datetime, filter_type: str, market: str, last_dt_str: str) -> bool:
+        if not dt:
+            return False
+        
+        now = datetime.now(KST)
+        
+        # 1. 상대 시간 필터
+        if filter_type == "실시간(1시간 이내)":
+            return now - timedelta(hours=1) <= dt <= now
+        elif filter_type == "6시간":
+            return now - timedelta(hours=6) <= dt <= now
+        elif filter_type == "12시간":
+            return now - timedelta(hours=12) <= dt <= now
+        elif filter_type == "24시간":
+            return now - timedelta(hours=24) <= dt <= now
+            
+        # 2. 거래 세션 기반 필터
+        try:
+            last_date = datetime.strptime(last_dt_str[:10], "%Y-%m-%d").date()
+        except Exception:
+            last_date = now.date()
+            
+        if market == "🇺🇸 미국":
+            dt_local = self._kst_to_et(dt)
+            open_time = datetime.combine(last_date, dtime(9, 30))
+            close_time = datetime.combine(last_date, dtime(16, 0))
+            prev_close_time = datetime.combine(last_date - timedelta(days=4), dtime(16, 0))
+            
+            if filter_type == "장전":
+                return prev_close_time <= dt_local < open_time
+            elif filter_type == "장중":
+                return open_time <= dt_local <= close_time
+            elif filter_type == "장후":
+                return dt_local > close_time
+        else: # "🇰🇷 한국"
+            dt_local = dt.astimezone(KST).replace(tzinfo=None)
+            open_time = datetime.combine(last_date, dtime(9, 0))
+            close_time = datetime.combine(last_date, dtime(15, 30))
+            prev_close_time = datetime.combine(last_date - timedelta(days=4), dtime(15, 30))
+            
+            if filter_type == "장전":
+                return prev_close_time <= dt_local < open_time
+            elif filter_type == "장중":
+                return open_time <= dt_local <= close_time
+            elif filter_type == "장후":
+                return dt_local > close_time
+                
+        return False
+
     def _collect_news(self, price_rows: list, market: str, when: str) -> dict:
         """종목별 구글 뉴스 RSS 헤드라인 수집 → {symbol: [기사,...]}.
-        장 마감 시각 이후 발행된 뉴스만 남긴다."""
+        선택한 뉴스 필터 조건에 부합하는 뉴스만 남긴다."""
         hl, gl, ceid = MARKET_PRESETS.get(market, MARKET_PRESETS["🇰🇷 한국"])
         out = {}
+        filter_type = self.news_filter_var.get()
         for row in price_rows:
             sym = row["symbol"]
-            # 검색어: 종목명 우선, 없으면 심볼 베이스(.KS 등 제거)
             name = row["name"]
             base = re.sub(r"\.[A-Z]+$", "", sym)
             query = name if name and name != sym else base
@@ -516,28 +662,15 @@ class StockReportSection:
                 f"https://news.google.com/rss/search?q={quote(q)}"
                 f"&hl={hl}&gl={gl}&ceid={ceid}"
             )
-            cutoff = self._market_close_cutoff(row["last_dt"], market)
             try:
                 items = self._fetch_rss(url)
-                # 장 마감(cutoff) 이후 발행된 뉴스만
-                fresh = [h for h in items if h.get("dt") and h["dt"] >= cutoff]
+                fresh = [h for h in items if h.get("dt") and self._is_in_filter(h["dt"], filter_type, market, row["last_dt"])]
                 out[sym] = fresh[:6]
-                print(f"  ✓ {sym} 장마감({cutoff:%Y-%m-%d %H:%M}) 후 뉴스 {len(out[sym])}건")
+                print(f"  ✓ {sym} 뉴스 필터({filter_type}) 적용 후 뉴스 {len(out[sym])}건")
             except Exception as e:
                 print(f"  [경고] {sym} 뉴스 수집 실패: {e}")
                 out[sym] = []
         return out
-
-    def _market_close_cutoff(self, last_dt_str: str, market: str) -> datetime:
-        """직전 거래일 장 마감 시각(KST) — 이후 뉴스만 '장 마감 후 뉴스'로 본다.
-        한국(KRX): 거래일 15:30 KST.  미국(NYSE/NASDAQ): 16:00 ET ≈ 익일 06:00 KST."""
-        try:
-            d = datetime.strptime(last_dt_str[:10], "%Y-%m-%d").date()
-        except Exception:
-            d = datetime.now(KST).date()
-        if market == "🇺🇸 미국":
-            return datetime.combine(d, dtime(6, 0), tzinfo=KST) + timedelta(days=1)
-        return datetime.combine(d, dtime(15, 30), tzinfo=KST)
 
     def _fetch_rss(self, url: str) -> list:
         req = urllib.request.Request(url, headers={
@@ -679,8 +812,7 @@ class StockReportSection:
             y_vals = rebased.values.astype(float)
             x_s, y_s = _cubic_smooth(x_num, y_vals)
             ax.plot(x_s, y_s, linewidth=1.3, color=color)
-            ends.append((float(y_vals[-1]), name_map.get(sym, sym), color,
-                         close.index[-1]))
+            ends.append((float(y_s[-1]), name_map.get(sym, sym), color, x_s[-1]))
 
         ax.axhline(100, color="#999999", linewidth=1, linestyle="--")
         ax.set_title(f"종가 추이 (기간 시작=100 기준)  ·  {period_label}", fontweight="bold")
@@ -703,28 +835,30 @@ class StockReportSection:
                 y = placed_y[-1] + min_gap
             placed_y.append(y)
         if placed_y:
-            ax.set_ylim(ymin, max(ymax, placed_y[-1] + min_gap))
+            # 라벨 상자가 y축 경계를 벗어나지 않도록 상하 패딩 추가
+            ax.set_ylim(min(ymin, placed_y[0] - min_gap * 0.6), max(ymax, placed_y[-1] + min_gap * 0.6))
 
-        # x축 우측 23% 연장 → 선은 원래 끝에서 멈추고
-        # 라벨은 연장 영역 안에서 오른쪽 정렬
+        # x축 우측을 연장하여 라벨이 축 상자 안쪽에 들어가도록 함
         xmin, xmax_data = ax.get_xlim()
         x_span = xmax_data - xmin
+        ax.set_xlim(xmin, xmax_data + x_span * 0.16)
+        
         fixed_ticks = [t for t in ax.get_xticks() if xmin <= t <= xmax_data]
-        ax.set_xlim(xmin, xmax_data + x_span * 0.09)
         ax.set_xticks(fixed_ticks)   # 연장 영역에 새 눈금 방지
 
-        # 모든 라벨의 오른쪽 끝을 동일한 x에 맞춰 우정렬
-        x_text = xmax_data + x_span * 0.085
+        # 라벨 시작 X 좌표: 데이터 끝에서 1.5% 우측 (좌측 정렬로 안쪽 배치)
+        x_text = xmax_data + x_span * 0.015
 
         for (last_y, name, color, last_x), y in zip(ends, placed_y):
             ax.annotate(
                 name,
-                xy=(mdates.date2num(last_x), last_y),
-                xytext=(x_text, y),
-                textcoords="data", va="center", ha="right",
+                xy=(last_x, last_y),                   # 선 끝 (정밀한 스무딩 좌표)
+                xytext=(x_text, y),                    # 라벨 위치 (데이터 좌표, 좌측 정렬)
+                textcoords="data",
+                va="center", ha="left",
                 fontsize=8, fontweight="bold", color=color,
-                annotation_clip=False,
-                arrowprops=dict(arrowstyle="-", color=color, lw=0.6, alpha=0.4),
+                annotation_clip=True,                  # 축 영역 내에만 표시
+                arrowprops=dict(arrowstyle="-", color=color, lw=0.6, alpha=0.5),
                 bbox=dict(boxstyle="round,pad=0.28", facecolor="white",
                           edgecolor=color, linewidth=1.3, alpha=0.90),
             )
@@ -760,15 +894,18 @@ class StockReportSection:
     # ──────────────────────────────────────────────
     # Gemini 분석
     # ──────────────────────────────────────────────
-    def _gen_analysis(self, cfg, price_rows, news_map, period_label, market) -> str:
+    def _gen_analysis(self, cfg, price_rows, news_map, period_label, market, news_filter) -> str:
         model_id = cfg.get("gemini_model", "gemini-3.1-flash-lite")
         client   = genai.Client(api_key=cfg["gemini_api_key"])
 
+        is_us = (market == "🇺🇸 미국")
+        def pfmt(v): return f"{v:,.2f}" if is_us else f"{v:,.0f}"
+
         price_txt = "\n".join(
             f"- {r['name']}({r['symbol']}): "
-            f"현재 종가 {r['last']:,.0f} (장 최종 {r['last_dt']}), "
+            f"현재 종가 {pfmt(r['last'])} (장 최종 {r['last_dt']}), "
             f"일간 {r['day_chg']:+.2f}%, 기간 {r['period_chg']:+.2f}%, "
-            f"기간고가 {r['high']:,.0f}, 기간저가 {r['low']:,.0f}"
+            f"기간고가 {pfmt(r['high'])}, 기간저가 {pfmt(r['low'])}"
             for r in price_rows
         )
         news_txt = ""
@@ -779,19 +916,22 @@ class StockReportSection:
             news_txt += "\n".join(f"  · ({h['date']}) {h['title']}" for h in heads) or "  · (뉴스 없음)"
             news_txt += "\n"
 
-        sys_inst = """당신은 증권 시황 분석 전문 에디터입니다.
+        price_rule = "- 미국 주식 시황 분석 시 본문에 인용하는 모든 주가 수치(달러)는 반드시 소수점 두 자리까지 정확히 표기할 것 (예: $125.43 또는 125.43달러)" if is_us else "- 한국 주식 분석 시 본문에 인용하는 주가는 소수점 없이 원화 정수로 표기할 것 (예: 72,500원)"
+
+        sys_inst = f"""당신은 증권 시황 분석 전문 에디터입니다.
 제공된 가격 데이터와 뉴스 헤드라인을 바탕으로 한국어 시황 분석 리포트를 작성하세요.
 규칙:
 - 본문에 쓰는 모든 가격 수치는 반드시 '종가(close)' 기준으로 작성 (장중가·시가 사용 금지)
 - 종목명은 반드시 제공된 한글 종목명으로 표기 (종목 코드 단독 표기 금지)
 - 반드시 제공된 수치(시작종가, 현재 종가, 등락률 등)를 인용해 근거를 제시
+{price_rule}
 - 뉴스 헤드라인과 가격 흐름을 연결해 해석
 - 과장·투자 권유 금지, 객관적 사실 기반
 - 마크다운/코드블록 없이 일반 문단 텍스트로만 출력
 - 종목 종합 요약 → 종목별 코멘트 → 유의점 순서, 800~1200자"""
 
         user = (
-            f"시장: {market}, 분석 기간: {period_label}\n\n"
+            f"시장: {market}, 분석 기간: {period_label}, 뉴스 시간대 필터: {news_filter}\n\n"
             f"[가격 데이터]\n{price_txt}\n\n"
             f"[뉴스 헤드라인]\n{news_txt}\n\n"
             "위 데이터를 바탕으로 시황 분석 리포트를 작성해 주세요."
@@ -809,8 +949,23 @@ class StockReportSection:
     # HTML 출력
     # ──────────────────────────────────────────────
     def _write_html(self, path, price_rows, news_map, analysis,
-                    line_png, bar_png, index_data, period_label, market, now) -> None:
+                    line_png, bar_png, index_data, period_label, market, now, news_filter) -> None:
         esc = html.escape
+
+        is_active = self._is_market_active(market)
+        title_prefix = "실시간 시세" if is_active else "당일 시세"
+
+        last_dt_label = price_rows[0]["last_dt"] if price_rows else ""
+        if last_dt_label and not is_active:
+            tz_suffix = " (ET)" if market == "🇺🇸 미국" else " (KST)"
+            if tz_suffix not in last_dt_label:
+                last_dt_label += tz_suffix
+
+        time_suffix = f": {last_dt_label}" if last_dt_label else ""
+        title_suffix = f"실시간 기준{time_suffix}" if is_active else f"장마감 기준{time_suffix}"
+        market_label = 'NYSE' if market == '🇺🇸 미국' else 'KRX'
+
+        market_summary_name = "미국 증시 요약" if market == "🇺🇸 미국" else "한국 증시 요약"
 
         def color(v):
             return "#E63B2E" if v >= 0 else "#0055FF"
@@ -883,7 +1038,7 @@ class StockReportSection:
             return re.sub(r"\.[A-Z]+$", "", sym)
 
         # 장 최종 일시 (헤더 아래 표시용)
-        last_dt_label = price_rows[0]["last_dt"] if price_rows else ""
+        # 이미 상단에서 정의됨
 
         # 가격 표
         price_trs = ""
@@ -922,9 +1077,20 @@ class StockReportSection:
                     "</tr>"
                 )
 
-        analysis_html = "".join(
-            f"<p>{esc(p.strip())}</p>" for p in analysis.split("\n") if p.strip()
-        )
+        analysis_html = ""
+        for p in analysis.split("\n"):
+            p_clean = p.strip()
+            if not p_clean:
+                continue
+            if p_clean.startswith('#'):
+                p_clean = re.sub(r'^#+\s*', '', p_clean)
+                p_clean = re.sub(r'[#\*\_]+', '', p_clean).strip()
+                analysis_html += f"<h3>{html.escape(p_clean)}</h3>"
+            else:
+                p_html = html.escape(p_clean)
+                p_html = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', p_html)
+                p_html = re.sub(r'\*(.*?)\*', r'<i>\1</i>', p_html)
+                analysis_html += f"<p>{p_html}</p>"
 
         doc = f"""<!DOCTYPE html>
 <html lang="ko"><head><meta charset="utf-8">
@@ -933,8 +1099,9 @@ class StockReportSection:
   body {{ font-family:'맑은 고딕','Malgun Gothic',sans-serif; max-width:920px;
           margin:0 auto; padding:24px; color:#1A1A1A; background:#F5F0E8; }}
   h1 {{ border-bottom:4px solid #1A1A1A; padding-bottom:8px; }}
-  h2 {{ background:#FFCC00; display:inline-block; padding:4px 12px;
-        border:2px solid #1A1A1A; margin-top:32px; }}
+  h2 {{ background:#FFCC00; display:inline-block; padding:5px 14px;
+        border:2px solid #1A1A1A; margin-top:32px; font-size:20px; font-weight:bold; }}
+  h3 {{ font-size:16px; font-weight:bold; margin-top:16px; margin-bottom:6px; }}
   table {{ border-collapse:collapse; width:100%; background:#fff;
            border:3px solid #1A1A1A; margin:12px 0; }}
   th {{ background:#1A1A1A; color:#fff; padding:8px; font-size:14px; }}
@@ -959,14 +1126,14 @@ class StockReportSection:
   .qtable td {{ border:1px solid #ddd; }}
 </style></head><body>
 <h1>📈 주식 / ETF 뉴스 리포트</h1>
-<p class="meta">시장: {esc(market)} &nbsp;|&nbsp; 분석 기간: {esc(period_label)}
+<p class="meta">시장: {esc(market)} &nbsp;|&nbsp; 분석 기간: {esc(period_label)} &nbsp;|&nbsp; 뉴스 필터: {esc(news_filter)}
 &nbsp;|&nbsp; 작성: {now.strftime('%Y-%m-%d %H:%M')} (KST)</p>
 
-<h2>① 당일 시세 <span style="font-size:13px;font-weight:normal;">({'NYSE 장마감 기준' if market == '🇺🇸 미국' else 'KRX 장마감 기준'})</span></h2>
+<h2>① {title_prefix} <span style="font-size:13px;font-weight:normal;">({market_label} {title_suffix})</span></h2>
 {idx_boxes_html}
 {quote_cards}
 
-<h2>② 가격 요약  분석 기간: {esc(period_label)}</h2>
+<h2>② {market_summary_name} &nbsp;|&nbsp; 분석 기간: {esc(period_label)}</h2>
 <p style="font-size:14px; font-weight:bold; color:#1A1A1A; margin:6px 0 10px 0;">장 최종 일시: {esc(last_dt_label)}</p>
 <table>
 <tr><th>종목</th><th>현재 종가</th><th>일간</th><th>기간등락</th><th>기간고가</th><th>기간저가</th><th>거래량</th></tr>

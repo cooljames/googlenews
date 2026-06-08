@@ -182,7 +182,7 @@ class NaverPosterGUI:
     def create_widgets(self) -> None:
         # ── 헤더 (검정 바) ──
         header = tk.Frame(self.root, bg=self.primary, pady=10)
-        header.pack(fill="x")
+        header.pack(fill="x", side="top")
 
         tk.Label(
             header,
@@ -198,27 +198,99 @@ class NaverPosterGUI:
             bg=self.primary, fg=self.accent,
         ).pack(side="left", padx=4)
 
+        # ── 글로벌 하단 로그 콘솔 ──
+        self.console_expanded = True
+        self.console_frame = tk.LabelFrame(
+            self.root,
+            font=("맑은 고딕", 10, "bold"),
+            bg=self.bg_card, fg=self.text_dark,
+            bd=3, relief="solid",
+            padx=8, pady=6,
+        )
+        self.console_frame.pack(fill="x", side="bottom", padx=16, pady=(0, 10))
+
+        # 콘솔 헤더 (제목 + 접기/펼치기 버튼)
+        header_frame = tk.Frame(self.console_frame, bg=self.bg_card)
+        lbl = tk.Label(
+            header_frame,
+            text="  실시간 작업 로그  ",
+            font=("맑은 고딕", 10, "bold"),
+            bg=self.bg_card, fg=self.text_dark,
+        )
+        lbl.pack(side="left")
+
+        self.toggle_btn = tk.Button(
+            header_frame,
+            text="[▼ 콘솔 접기]",
+            font=("맑은 고딕", 8, "bold"),
+            bg=self.accent, fg=self.text_dark,
+            activebackground=self.hover_dark, activeforeground=self.text_dark,
+            bd=1, relief="solid", cursor="hand2",
+            padx=6, pady=1,
+            command=self.toggle_console,
+        )
+        self.toggle_btn.pack(side="left", padx=10)
+        self.console_frame.configure(labelwidget=header_frame)
+
+        self.log_text = scrolledtext.ScrolledText(
+            self.console_frame,
+            height=6,
+            bg=self.primary, fg=self.accent,
+            insertbackground=self.accent,
+            font=("Consolas", 9),
+            bd=2, relief="solid",
+            state="disabled",
+        )
+        self.log_text.pack(fill="both", expand=True)
+
+        # ── 메인 탭 노트북 ──
         self.notebook = ttk.Notebook(self.root, style="TNotebook")
         self.notebook.pack(fill="both", expand=True, padx=16, pady=10)
 
-        self.tab_post = tk.Frame(self.notebook, bg=self.bg_dark)
-        self.notebook.add(self.tab_post, text="  📝 글쓰기 (Post)  ")
+        # Tab 1: 블로그 발행
+        self.tab_blog = tk.Frame(self.notebook, bg=self.bg_dark)
+        self.notebook.add(self.tab_blog, text="  📝 블로그 발행  ")
 
+        # Tab 2: 뉴스 분석
+        self.tab_news = tk.Frame(self.notebook, bg=self.bg_dark)
+        self.notebook.add(self.tab_news, text="  📰 뉴스 분석  ")
+
+        # Tab 3: 주식 리포트
         self.tab_stock = tk.Frame(self.notebook, bg=self.bg_dark)
-        self.notebook.add(self.tab_stock, text="  📈 주식 리포트 (Stock)  ")
+        self.notebook.add(self.tab_stock, text="  📈 주식 리포트  ")
 
+        # Tab 4: 종목 탐색
+        self.tab_explorer = tk.Frame(self.notebook, bg=self.bg_dark)
+        self.notebook.add(self.tab_explorer, text="  🔍 종목 탐색  ")
+
+        # Tab 5: 설정
         self.tab_settings = tk.Frame(self.notebook, bg=self.bg_dark)
-        self.notebook.add(self.tab_settings, text="  ⚙️ 설정 (Settings)  ")
+        self.notebook.add(self.tab_settings, text="  ⚙️ 설정  ")
 
-        self.build_post_tab()
+        self.build_blog_tab()
+        self.build_news_tab()
         self.build_stock_tab()
+        self.build_explorer_tab()
         self.build_settings_tab()
+
+    def toggle_console(self) -> None:
+        if self.console_expanded:
+            self.log_text.pack_forget()
+            self.toggle_btn.configure(text="[▲ 콘솔 열기]")
+            self.console_expanded = False
+        else:
+            self.log_text.pack(fill="both", expand=True)
+            self.toggle_btn.configure(text="[▼ 콘솔 접기]")
+            self.console_expanded = True
 
     # ──────────────────────────────────────────────
     # 글쓰기 탭
     # ──────────────────────────────────────────────
-    def build_post_tab(self) -> None:
-        container = tk.Frame(self.tab_post, bg=self.bg_dark)
+    # ──────────────────────────────────────────────
+    # 블로그 발행 탭
+    # ──────────────────────────────────────────────
+    def build_blog_tab(self) -> None:
+        container = tk.Frame(self.tab_blog, bg=self.bg_dark)
         container.pack(fill="both", expand=True, padx=8, pady=6)
 
         # ── [1] 블로그 글 생성 주제 ──
@@ -230,18 +302,17 @@ class NaverPosterGUI:
             bd=3, relief="solid",
             padx=10, pady=8,
         )
-        prompt_frame.pack(fill="x", pady=(0, 6))
+        prompt_frame.pack(fill="both", expand=True, pady=(0, 6))
 
         self.prompt_text = tk.Text(
             prompt_frame,
-            height=4,
             bg=self.bg_input, fg=self.text_dark,
             insertbackground=self.text_dark,
             font=("맑은 고딕", 10),
             bd=2, relief="solid",
             padx=6, pady=6,
         )
-        self.prompt_text.pack(fill="x")
+        self.prompt_text.pack(fill="both", expand=True)
         self.prompt_text.insert(
             "1.0",
             "요즘 뜨고 있는 유용한 AI 코딩 툴의 트렌드와 장점을 소개하는 글을 써줘.",
@@ -262,34 +333,16 @@ class NaverPosterGUI:
         self.post_btn.bind("<Enter>", lambda e: self._on_hover(e, self.accent))
         self.post_btn.bind("<Leave>", lambda e: self._on_hover(e, self.primary))
 
-        # ── [3] 구분선 ──
-        tk.Frame(container, bg=self.border_color, height=3).pack(fill="x", pady=8)
+    # ──────────────────────────────────────────────
+    # 뉴스 분석 탭
+    # ──────────────────────────────────────────────
+    def build_news_tab(self) -> None:
+        container = tk.Frame(self.tab_news, bg=self.bg_dark)
+        container.pack(fill="both", expand=True, padx=8, pady=6)
 
-        # ── [4] 뉴스 기사 분석 (news_analyzer.py) ──
+        # ── 뉴스 기사 분석 (news_analyzer.py) ──
         self.news_section = NewsAnalyzerSection(self.root, self._theme_dict())
         self.news_section.build(container)
-
-        # ── [5] 로그 창 ──
-        log_frame = tk.LabelFrame(
-            container,
-            text="  실시간 작업 로그 (Logs)  ",
-            font=("맑은 고딕", 10, "bold"),
-            bg=self.bg_card, fg=self.text_dark,
-            bd=3, relief="solid",
-            padx=8, pady=6,
-        )
-        log_frame.pack(fill="both", expand=True, pady=(6, 0))
-
-        self.log_text = scrolledtext.ScrolledText(
-            log_frame,
-            height=7,
-            bg=self.primary, fg=self.accent,
-            insertbackground=self.accent,
-            font=("Consolas", 9),
-            bd=2, relief="solid",
-            state="disabled",
-        )
-        self.log_text.pack(fill="both", expand=True)
 
     # ──────────────────────────────────────────────
     # 테마 딕셔너리 (섹션 모듈에 전달)
@@ -331,24 +384,26 @@ class NaverPosterGUI:
         self.stock_section = StockReportSection(self.root, self._theme_dict())
         self.stock_section.build(container)
 
-        if IndustrySectorSection is not None:
-            self.industry_section = IndustrySectorSection(
-                self.root, self._theme_dict(), self.stock_section
-            )
-            self.industry_section.build(container)
-
-        if InvestorTradeSection is not None:
-            self.investor_section = InvestorTradeSection(
-                self.root, self._theme_dict(), self.stock_section
-            )
-            self.investor_section.build(container)
-
         # 공용 로그 안내
         tk.Label(
             container,
-            text="※ 진행 상황은 '글쓰기' 탭 하단의 실시간 작업 로그에 출력됩니다.",
+            text="※ 진행 상황은 하단 실시간 작업 로그에 출력됩니다.",
             font=("맑은 고딕", 8), bg=self.bg_dark, fg=self.text_muted, anchor="w",
         ).pack(fill="x", pady=(8, 0))
+
+    # ──────────────────────────────────────────────
+    # 종목 탐색 탭
+    # ──────────────────────────────────────────────
+    def build_explorer_tab(self) -> None:
+        container = tk.Frame(self.tab_explorer, bg=self.bg_dark)
+        container.pack(fill="both", expand=True, padx=8, pady=6)
+
+        if IndustrySectorSection is not None:
+            self.industry_section = IndustrySectorSection(
+                self.root, self._theme_dict(), self.stock_section,
+                main_notebook=self.notebook, sub_notebook=None
+            )
+            self.industry_section.build(container)
 
     # ──────────────────────────────────────────────
     # 설정 탭
