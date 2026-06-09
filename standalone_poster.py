@@ -12,6 +12,7 @@ from ctypes import wintypes
 import json
 import msvcrt
 import os
+import re
 import time
 import pyperclip
 import undetected_chromedriver as uc
@@ -242,9 +243,238 @@ def get_driver(naver_id, chrome_profile_path=None):
     )
     return driver
 
-def clipboard_paste(driver, element, text):
+def _prepare_html_for_clipboard(html_text: str) -> str:
+    """전체 HTML 문서에서 클립보드 프래그먼트용 콘텐츠를 추출하고,
+    네이버 에디터 호환을 위해 테이블·단락 등 주요 인라인 스타일을 보강합니다."""
+    import re
+
+    # 1. <style> 블록에서 CSS 규칙 추출 (인라인 보강 참고용)
+    style_blocks = re.findall(r'<style[^>]*>(.*?)</style>', html_text,
+                              flags=re.DOTALL | re.IGNORECASE)
+    # 합쳐서 키-값 파싱 (간이)
+    css_text = '\n'.join(style_blocks)
+
+    def _css_value(selector: str, prop: str) -> str:
+        """css_text 에서 selector { ... prop: VALUE; } 추출."""
+        pat = re.compile(
+            re.escape(selector) + r'\s*\{([^}]*)\}', re.IGNORECASE)
+        m = pat.search(css_text)
+        if not m:
+            return ''
+        block = m.group(1)
+        pm = re.search(re.escape(prop) + r'\s*:\s*([^;]+)', block, re.IGNORECASE)
+        return pm.group(1).strip() if pm else ''
+
+    # 2. <body> 내부 콘텐츠만 추출 (중첩 html/head/body 방지)
+    body_match = re.search(r'<body[^>]*>(.*)</body>',
+                           html_text, flags=re.DOTALL | re.IGNORECASE)
+    if body_match:
+        content = body_match.group(1).strip()
+    else:
+        # body 태그가 없으면 문서 껍데기만 제거
+        content = html_text
+        content = re.sub(r'<!DOCTYPE[^>]*>', '', content, flags=re.IGNORECASE)
+        content = re.sub(r'</?html[^>]*>', '', content, flags=re.IGNORECASE)
+        content = re.sub(r'<head[^>]*>.*?</head>', '', content,
+                         flags=re.DOTALL | re.IGNORECASE)
+        content = content.strip()
+
+    # 3. <style> 블록 자체를 본문에서 제거 (이미 인라인으로 적용할 것)
+    content = re.sub(r'<style[^>]*>.*?</style>', '', content,
+                     flags=re.DOTALL | re.IGNORECASE)
+
+    # 4. <table> 인라인 스타일 보강 (border-collapse + border)
+    table_style = (
+        'border-collapse:collapse; width:100%; '
+        'border:3px solid #1A1A1A; margin:12px 0; background:#fff;'
+    )
+    def _ensure_table(m):
+        tag = m.group(0)
+        if 'style=' in tag.lower():
+            # 기존 style이 있지만 border가 없으면 추가
+            if 'border' not in tag.lower():
+                return re.sub(r"style=[\"']", lambda s: s.group(0) + table_style + ' ',
+                              tag, count=1, flags=re.IGNORECASE)
+            return tag
+        return tag[:-1] + f' style="{table_style}">'
+    content = re.sub(r'<table[^>]*>', _ensure_table, content, flags=re.IGNORECASE)
+
+    # 5. <th> 인라인 스타일 보강
+    th_style = 'background:#1A1A1A; color:#fff; padding:8px; font-size:14px; border:1px solid #ccc;'
+    def _ensure_th(m):
+        tag = m.group(0)
+        if 'style=' in tag.lower():
+            if 'border' not in tag.lower():
+                return re.sub(r"style=[\"']", lambda s: s.group(0) + th_style + ' ',
+                              tag, count=1, flags=re.IGNORECASE)
+            return tag
+        return tag[:-1] + f' style="{th_style}">'
+    content = re.sub(r'<th[^>]*>', _ensure_th, content, flags=re.IGNORECASE)
+
+    # 6. <td> 인라인 스타일 보강
+    td_base = 'border:1px solid #ccc; padding:8px; font-size:13px; vertical-align:top;'
+    def _ensure_td(m):
+        tag = m.group(0)
+        if 'style=' in tag.lower():
+            # 이미 style이 있으면 border만 보강
+            if 'border' not in tag.lower():
+                return re.sub(r"style=[\"']", lambda s: s.group(0) + 'border:1px solid #ccc; ',
+                              tag, count=1, flags=re.IGNORECASE)
+            return tag
+        return tag[:-1] + f' style="{td_base}">'
+    content = re.sub(r'<td[^>]*>', _ensure_td, content, flags=re.IGNORECASE)
+
+    # 7. <p> 인라인 스타일 보강 (단락 여백 + 줄간격 유지)
+    def _ensure_p(m):
+        tag = m.group(0)
+        if 'style=' in tag.lower():
+            extra = ''
+            if 'line-height' not in tag.lower():
+                extra += 'line-height:1.7; '
+            if 'margin' not in tag.lower():
+                extra += 'margin:10px 0; '
+            if extra:
+                return re.sub(r"style=[\"']", lambda s: s.group(0) + extra,
+                              tag, count=1, flags=re.IGNORECASE)
+            return tag
+        return tag[:-1] + ' style="line-height:1.7; margin:10px 0;">'
+    content = re.sub(r'<p[^>]*>', _ensure_p, content, flags=re.IGNORECASE)
+
+    # 8. <h2> 인라인 스타일 보강 (섹션 제목, 밑줄 방지)
+    h2_style = (
+        'background:#FFCC00; display:inline-block; padding:5px 14px; '
+        'border:2px solid #1A1A1A; margin-top:32px; font-size:20px; font-weight:bold; '
+        'text-decoration:none; border-bottom:none;'
+    )
+    def _ensure_h2(m):
+        tag = m.group(0)
+        if 'style=' not in tag.lower():
+            return tag[:-1] + f' style="{h2_style}">'
+        if 'text-decoration' not in tag.lower():
+            return re.sub(r"style=[\"']", lambda s: s.group(0) + 'text-decoration:none; border-bottom:none; ',
+                          tag, count=1, flags=re.IGNORECASE)
+        return tag
+    content = re.sub(r'<h2[^>]*>', _ensure_h2, content, flags=re.IGNORECASE)
+
+    # 9. <h3> 인라인 스타일 보강 (소제목, 밑줄 방지)
+    h3_style = (
+        'font-size:16px; font-weight:bold; margin-top:16px; margin-bottom:6px; '
+        'text-decoration:none; border-bottom:none;'
+    )
+    def _ensure_h3(m):
+        tag = m.group(0)
+        if 'style=' not in tag.lower():
+            return tag[:-1] + f' style="{h3_style}">'
+        if 'text-decoration' not in tag.lower():
+            return re.sub(r"style=[\"']", lambda s: s.group(0) + 'text-decoration:none; border-bottom:none; ',
+                          tag, count=1, flags=re.IGNORECASE)
+        return tag
+    content = re.sub(r'<h3[^>]*>', _ensure_h3, content, flags=re.IGNORECASE)
+
+    return content
+
+
+def copy_html_and_text_to_clipboard(plain_text: str, html_text: str) -> bool:
+    """Windows 클립보드에 평문(CF_UNICODETEXT)과 HTML 포맷(HTML Format)을 동시에 등록."""
+    import ctypes
+    from ctypes import wintypes
+    
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    
+    if not user32.OpenClipboard(None):
+        return False
+        
+    try:
+        user32.EmptyClipboard()
+        
+        # 1. 평문 등록 (CF_UNICODETEXT = 13)
+        if plain_text:
+            text_bytes = plain_text.encode('utf-16le')
+            GMEM_MOVEABLE = 0x0002
+            h_text_mem = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(text_bytes) + 2)
+            if h_text_mem:
+                p_text_mem = kernel32.GlobalLock(h_text_mem)
+                if p_text_mem:
+                    ctypes.memmove(p_text_mem, text_bytes, len(text_bytes))
+                    ctypes.memset(p_text_mem + len(text_bytes), 0, 2)
+                    kernel32.GlobalUnlock(h_text_mem)
+                    user32.SetClipboardData(13, h_text_mem)
+                    
+        # 2. HTML 등록 (전처리 후 프래그먼트로 삽입)
+        if html_text:
+            # 전체 HTML 문서 → body 추출 + 인라인 스타일 보강
+            fragment_content = _prepare_html_for_clipboard(html_text)
+
+            header = (
+                "Version:0.9\r\n"
+                "StartHTML:{start_html:08d}\r\n"
+                "EndHTML:{end_html:08d}\r\n"
+                "StartFragment:{start_fragment:08d}\r\n"
+                "EndFragment:{end_fragment:08d}\r\n"
+            )
+            dummy = header.format(start_html=0, end_html=0, start_fragment=0, end_fragment=0)
+            dummy_len = len(dummy.encode('utf-8'))
+            
+            fragment_start_tag = "<!--StartFragment-->"
+            fragment_end_tag = "<!--EndFragment-->"
+            
+            html_doc = (
+                "<html>\r\n"
+                "<body>\r\n"
+                f"{fragment_start_tag}{fragment_content}{fragment_end_tag}\r\n"
+                "</body>\r\n"
+                "</html>"
+            )
+            
+            start_html = dummy_len
+            start_fragment = start_html + len("<html>\r\n<body>\r\n".encode('utf-8')) + len(fragment_start_tag.encode('utf-8'))
+            end_fragment = start_fragment + len(fragment_content.encode('utf-8'))
+            end_html = end_fragment + len(fragment_end_tag.encode('utf-8')) + len("\r\n</body>\r\n</html>".encode('utf-8'))
+            
+            final_payload = header.format(
+                start_html=start_html,
+                end_html=end_html,
+                start_fragment=start_fragment,
+                end_fragment=end_fragment
+            ) + html_doc
+            
+            payload_bytes = final_payload.encode('utf-8')
+            
+            CF_HTML = user32.RegisterClipboardFormatW("HTML Format")
+            if CF_HTML:
+                h_html_mem = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(payload_bytes) + 1)
+                if h_html_mem:
+                    p_html_mem = kernel32.GlobalLock(h_html_mem)
+                    if p_html_mem:
+                        ctypes.memmove(p_html_mem, payload_bytes, len(payload_bytes))
+                        ctypes.memset(p_html_mem + len(payload_bytes), 0, 1)
+                        kernel32.GlobalUnlock(h_html_mem)
+                        user32.SetClipboardData(CF_HTML, h_html_mem)
+        return True
+    except Exception as e:
+        print(f"[클립보드] 리치 텍스트 복사 실패: {e}")
+        return False
+    finally:
+        user32.CloseClipboard()
+
+def clipboard_paste(driver, element, text, force_plain=False):
     """클립보드를 통한 복사 붙여넣기로 캡차(CAPTCHA) 방지"""
-    pyperclip.copy(text)
+    import re
+    
+    is_html = False
+    if not force_plain:
+        is_html = bool(re.search(r'<(?:html|body|div|table|p|h[1-6]|ul|ol|br\s*/?)[\s>]', text, re.IGNORECASE))
+        
+    copied = False
+    if is_html and os.name == "nt":
+        # HTML 태그 제거하여 평문(fallback) 추출
+        plain_text = re.sub(r"<[^>]+>", "", text)
+        copied = copy_html_and_text_to_clipboard(plain_text, text)
+        
+    if not copied:
+        pyperclip.copy(text)
+        
     try:
         element.click()
     except Exception:
@@ -348,7 +578,7 @@ def ensure_logged_in(driver, uid, upw):
         print("✅ 기존 로그인 세션이 유효합니다. (자동/수동 로그인 건너뜀)")
         save_cookies(driver, uid)  # 세션 갱신
 
-def write_post(driver, uid, title, content):
+def write_post(driver, uid, title, content, tags=""):
     print("📝 글쓰기 페이지로 이동 중...")
     driver.get(f"https://blog.naver.com/{uid}?Redirect=Write")
     time.sleep(3)
@@ -395,14 +625,71 @@ def write_post(driver, uid, title, content):
     title_el = wait.until(
         EC.presence_of_element_located((By.CSS_SELECTOR, ".se-title-text"))
     )
-    clipboard_paste(driver, title_el, title)
+    clipboard_paste(driver, title_el, title, force_plain=True)
     
     # 본문 입력
     body_el = wait.until(
         EC.presence_of_element_located((By.CSS_SELECTOR, ".se-component.se-text .se-text-paragraph"))
     )
     clipboard_paste(driver, body_el, content)
-    
+    time.sleep(1.0)
+
+    # 에디터 태그 입력 (발행 전 태그 섹션)
+    if tags:
+        tag_list = re.findall(r"#?([^\s#]+)", tags)
+        tag_list = [t for t in tag_list if t]
+        tag_entered = False
+        tag_selectors = [
+            ".se-tag-input",
+            ".tag-input",
+            "input.se_input_text",
+            ".se_tag input",
+            "input[placeholder*='태그']",
+            "input[placeholder*='tag']",
+            ".tag_area input",
+            ".se-section-tag input",
+        ]
+        for sel in tag_selectors:
+            try:
+                tag_el = driver.find_element(By.CSS_SELECTOR, sel)
+                if tag_el.is_displayed():
+                    for tag in tag_list:
+                        clipboard_paste(driver, tag_el, tag, force_plain=True)
+                        time.sleep(0.2)
+                        tag_el.send_keys(Keys.RETURN)
+                        time.sleep(0.2)
+                    tag_entered = True
+                    print(f"[태그] 에디터 태그 섹션에 {len(tag_list)}개 입력 완료")
+                    break
+            except Exception:
+                continue
+        if not tag_entered:
+            # JavaScript 기반 탐색
+            js_find_tag = """
+            var inputs = document.querySelectorAll('input');
+            for (var i=0; i<inputs.length; i++){
+                var ph = (inputs[i].placeholder||'').toLowerCase();
+                if (ph.indexOf('태그')!==-1 || ph.indexOf('tag')!==-1){
+                    return inputs[i];
+                }
+            }
+            return null;
+            """
+            try:
+                tag_el = driver.execute_script(js_find_tag)
+                if tag_el:
+                    for tag in tag_list:
+                        clipboard_paste(driver, tag_el, tag, force_plain=True)
+                        time.sleep(0.2)
+                        tag_el.send_keys(Keys.RETURN)
+                        time.sleep(0.2)
+                    tag_entered = True
+                    print(f"[태그] JS 탐색으로 {len(tag_list)}개 입력 완료")
+            except Exception as e:
+                print(f"[태그] JS 탐색 실패: {e}")
+        if not tag_entered:
+            print("⚠️ [태그] 에디터 태그 입력 필드를 찾지 못했습니다. 발행 설정 창에서 재시도합니다.")
+
     print("📤 글 발행 처리 중...")
     # 1. 상단 발행 버튼 클릭
     publish_btn = wait.until(
@@ -419,7 +706,143 @@ def write_post(driver, uid, title, content):
         print("[발행] 상단 '발행' 버튼 클릭 성공 (일반 클릭)")
     time.sleep(1.5)
     
-    # 2. 최종 발행 확인 버튼 클릭 (발행 레이어 내부 버튼 타겟팅)
+    # 2. 발행 설정 레이어에서 "비공개" 옵션 선택
+    print("[발행] 비공개 옵션을 선택합니다...")
+    private_set = False
+    try:
+        # 방법 1: CSS 클래스 기반 비공개 라디오/라벨 탐색
+        private_selectors = [
+            ".se-publish-option-visibility .se-publish-option-private",
+            ".se-publish-visibility-item.se-publish-visibility-private",
+            "label.se-publish-option-item[data-value='0']",
+            "label[for*='private']",
+            ".se-publish-private-option",
+        ]
+        for sel in private_selectors:
+            try:
+                el = driver.find_element(By.CSS_SELECTOR, sel)
+                if el.is_displayed():
+                    driver.execute_script("arguments[0].click();", el)
+                    private_set = True
+                    print(f"[발행] 비공개 옵션 선택 성공 (CSS: {sel})")
+                    break
+            except Exception:
+                continue
+
+        # 방법 2: 텍스트 내용으로 "비공개" 라벨/버튼 탐색
+        if not private_set:
+            js_click_private = """
+            var labels = document.querySelectorAll(
+                '.se-publish-option label, .se-publish-setting label, ' +
+                '.se-popup-publish-option label, [class*="publish"] label, ' +
+                '[class*="visibility"] label, [class*="option"] span'
+            );
+            for (var i = 0; i < labels.length; i++) {
+                var txt = labels[i].textContent.trim();
+                if (txt === '비공개' || txt.indexOf('비공개') !== -1) {
+                    labels[i].click();
+                    return 'ok';
+                }
+            }
+            // input[type=radio] 탐색 (value 기반)
+            var radios = document.querySelectorAll('input[type="radio"]');
+            for (var j = 0; j < radios.length; j++) {
+                var lbl = radios[j].parentElement;
+                if (lbl && lbl.textContent.indexOf('비공개') !== -1) {
+                    radios[j].click();
+                    return 'ok';
+                }
+            }
+            return 'not_found';
+            """
+            result = driver.execute_script(js_click_private)
+            if result == 'ok':
+                private_set = True
+                print("[발행] 비공개 옵션 선택 성공 (JS 텍스트 탐색)")
+
+        # 방법 3: XPath로 "비공개" 텍스트를 포함하는 클릭 가능 요소 탐색
+        if not private_set:
+            try:
+                xpath_targets = [
+                    "//label[contains(text(), '비공개')]",
+                    "//span[contains(text(), '비공개')]/ancestor::label",
+                    "//span[contains(text(), '비공개')]",
+                    "//*[contains(@class, 'publish')]//*[contains(text(), '비공개')]",
+                ]
+                for xp in xpath_targets:
+                    try:
+                        el = driver.find_element(By.XPATH, xp)
+                        if el.is_displayed():
+                            driver.execute_script("arguments[0].click();", el)
+                            private_set = True
+                            print(f"[발행] 비공개 옵션 선택 성공 (XPath)")
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        if not private_set:
+            print("⚠️ [발행] 비공개 옵션을 자동으로 찾지 못했습니다. 수동으로 확인해 주세요.")
+    except Exception as e:
+        print(f"⚠️ [발행] 비공개 설정 중 오류: {e}")
+
+    time.sleep(1.0)
+
+    # 2-1. 발행 설정 패널 내 태그 입력 (에디터 태그 섹션에서 실패했을 경우 포함)
+    if tags:
+        tag_list = re.findall(r"#?([^\s#]+)", tags)
+        tag_list = [t for t in tag_list if t]
+        publish_tag_selectors = [
+            ".se-publish-tag-area input",
+            ".se-publish-section-tag input",
+            ".publish_tag_wrap input",
+            "input[class*='publish'][class*='tag']",
+            ".se-popup-tag-input",
+            "input[placeholder*='태그']",
+            "input[placeholder*='tag']",
+        ]
+        publish_tag_entered = False
+        for sel in publish_tag_selectors:
+            try:
+                tag_el = driver.find_element(By.CSS_SELECTOR, sel)
+                if tag_el.is_displayed():
+                    for tag in tag_list:
+                        clipboard_paste(driver, tag_el, tag, force_plain=True)
+                        time.sleep(0.2)
+                        tag_el.send_keys(Keys.RETURN)
+                        time.sleep(0.2)
+                    publish_tag_entered = True
+                    print(f"[태그] 발행 설정 패널에 {len(tag_list)}개 태그 입력 완료")
+                    break
+            except Exception:
+                continue
+        if not publish_tag_entered:
+            js_publish_tag = """
+            var inputs = document.querySelectorAll('input');
+            for (var i=0; i<inputs.length; i++){
+                var ph = (inputs[i].placeholder||'').toLowerCase();
+                if (ph.indexOf('태그')!==-1 || ph.indexOf('tag')!==-1){
+                    return inputs[i];
+                }
+            }
+            return null;
+            """
+            try:
+                tag_el = driver.execute_script(js_publish_tag)
+                if tag_el:
+                    for tag in tag_list:
+                        clipboard_paste(driver, tag_el, tag, force_plain=True)
+                        time.sleep(0.2)
+                        tag_el.send_keys(Keys.RETURN)
+                        time.sleep(0.2)
+                    print(f"[태그] JS 탐색으로 발행 패널 태그 {len(tag_list)}개 입력 완료")
+            except Exception as e:
+                print(f"[태그] 발행 패널 태그 입력 실패: {e}")
+
+    time.sleep(0.5)
+
+    # 3. 최종 발행 확인 버튼 클릭 (발행 레이어 내부 버튼 타겟팅)
     confirm_btn = wait.until(
         EC.presence_of_element_located((By.CSS_SELECTOR, ".se-publish-submit-button, button[class*='confirm_btn']"))
     )

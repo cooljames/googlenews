@@ -13,7 +13,7 @@ import webbrowser
 import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from datetime import datetime, timezone, timedelta, time as dtime
+from datetime import datetime, timezone, timedelta, time as dtime, date
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote
 
@@ -29,6 +29,9 @@ import yfinance as yf
 from google import genai
 from google.genai import types
 
+import market_data as md
+import prefs
+
 try:
     from standalone_poster import load_config
 except ImportError:
@@ -42,6 +45,8 @@ matplotlib.rcParams["axes.unicode_minus"] = False
 
 # 기간: 표시명 → (yfinance period, 뉴스 검색 when:)
 PERIOD_PRESETS = {
+    "장전후": ("5d", "5d"),
+    "장중": ("5d", "5d"),
     "1주": ("7d",  "7d"),
     "1개월": ("1mo", "14d"),
     "3개월": ("3mo", "14d"),
@@ -114,14 +119,17 @@ class StockReportSection:
         self.tertiary_hov = theme.get("tertiary_hov", "#003DD6")
         self.primary      = theme.get("primary", "#1A1A1A")
         self.border_color = theme.get("border_color", "#1A1A1A")
+        self.bg_window    = theme.get("bg_dark", "#F5F0E8")  # 탭/창 배경
         self._kr_cache: dict = {}  # 한국 종목 실시간 조회 캐시 (code → {name, suffix})
 
     # ──────────────────────────────────────────────
     # UI 구성
     # ──────────────────────────────────────────────
     def build(self, container: tk.Frame) -> None:
+        inner = self._build_scroll(container)
+
         frame = tk.LabelFrame(
-            container,
+            inner,
             text="  📈 주식 / ETF 뉴스 리포트  ",
             font=("맑은 고딕", 10, "bold"),
             bg=self.bg_card, fg=self.text_dark,
@@ -153,7 +161,8 @@ class StockReportSection:
 
         tk.Label(opt_row, text="기간:", font=("맑은 고딕", 9, "bold"),
                  bg=self.bg_card, fg=self.text_dark).pack(side="left", padx=(0, 4))
-        self.period_var = tk.StringVar(value="1개월")
+        is_kr_active = self._is_market_active("🇰🇷 한국")
+        self.period_var = tk.StringVar(value="장중" if is_kr_active else "장전후")
         ttk.Combobox(opt_row, textvariable=self.period_var,
                      values=list(PERIOD_PRESETS.keys()),
                      state="readonly", width=8, font=("맑은 고딕", 9)
@@ -161,9 +170,9 @@ class StockReportSection:
 
         tk.Label(opt_row, text="뉴스 필터:", font=("맑은 고딕", 9, "bold"),
                  bg=self.bg_card, fg=self.text_dark).pack(side="left", padx=(10, 4))
-        self.news_filter_var = tk.StringVar(value="장후")
+        self.news_filter_var = tk.StringVar(value="실시간(1시간 이내)")
         ttk.Combobox(opt_row, textvariable=self.news_filter_var,
-                     values=["장전", "장중", "장후", "실시간(1시간 이내)", "6시간", "12시간", "24시간"],
+                     values=["실시간(1시간 이내)", "6시간", "12시간", "24시간"],
                      state="readonly", width=16, font=("맑은 고딕", 9)
                      ).pack(side="left")
 
@@ -178,7 +187,7 @@ class StockReportSection:
             font=("Consolas", 10),
         )
         self.ticker_entry.pack(side="left", fill="x", expand=True)
-        self.ticker_entry.insert(0, "005930.KS, 069500.KS")
+        self.ticker_entry.insert(0, "반도체, AI, 엔비디아, 환율")
 
         # 상태 레이블
         self.status_lbl = tk.Label(
@@ -221,9 +230,188 @@ class StockReportSection:
         self.last_html_path: str = ""
         self._on_market_change()
 
+        # ── 장 상태 표시줄 + 한·미 분석 변수 선택 패널 ──
+        self._build_status_bar(inner)
+        self.var_state: dict = {}        # {market: {cat: {key: BooleanVar}}}
+        self._cat_vars: dict = {}        # {(market,cat): [BooleanVar(ok만)]}
+        self._build_analysis_panels(inner)
+        self._restore_prefs()
+        self._refresh_status_bar()       # 첫 표시 + 주기 갱신 시작
+
+    # ──────────────────────────────────────────────
+    # 스크롤 스캐폴드
+    # ──────────────────────────────────────────────
+    def _build_scroll(self, container: tk.Frame) -> tk.Frame:
+        canvas = tk.Canvas(container, bg=self.bg_window, highlightthickness=0)
+        vsb = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        inner = tk.Frame(canvas, bg=self.bg_window)
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_inner_config(_e):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        inner.bind("<Configure>", _on_inner_config)
+
+        def _on_canvas_config(e):
+            canvas.itemconfigure(win, width=e.width)   # 가로 폭 맞춤
+        canvas.bind("<Configure>", _on_canvas_config)
+
+        # 마우스휠: 캔버스에 들어왔을 때만 전역 바인딩
+        def _wheel(e):
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _wheel))
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+
+        self._scroll_canvas = canvas
+        return inner
+
     def _hover(self, event, color: str) -> None:
         if event.widget["state"] != "disabled":
             event.widget["background"] = color
+
+    # ──────────────────────────────────────────────
+    # 장 상태 표시줄
+    # ──────────────────────────────────────────────
+    def _build_status_bar(self, parent: tk.Frame) -> None:
+        bar = tk.LabelFrame(
+            parent, text="  🕐 현재 장 상태 (KST 기준)  ",
+            font=("맑은 고딕", 10, "bold"),
+            bg=self.bg_card, fg=self.text_dark,
+            bd=3, relief="solid", padx=10, pady=8,
+        )
+        bar.pack(fill="x", pady=4)
+        self.status_kr_lbl = tk.Label(bar, font=("맑은 고딕", 10, "bold"),
+                                      bg=self.bg_card, anchor="w")
+        self.status_kr_lbl.pack(fill="x")
+        self.status_us_lbl = tk.Label(bar, font=("맑은 고딕", 10, "bold"),
+                                      bg=self.bg_card, anchor="w")
+        self.status_us_lbl.pack(fill="x")
+
+    def _refresh_status_bar(self) -> None:
+        krl, krd, kr_live = md.kr_status()
+        usl, usd, us_live = md.us_status()
+        self.status_kr_lbl.configure(
+            text=f"🇰🇷 한국: {krl}  ·  {krd}  ·  "
+                 f"{'실시간' if kr_live else '전일/마감 데이터'}",
+            fg="#E63B2E" if kr_live else self.text_muted)
+        self.status_us_lbl.configure(
+            text=f"🇺🇸 미국: {usl}  ·  {usd}  ·  "
+                 f"{'실시간' if us_live else '마감 데이터'}",
+            fg="#E63B2E" if us_live else self.text_muted)
+        self.root.after(60000, self._refresh_status_bar)
+
+    # ──────────────────────────────────────────────
+    # 분석 변수 선택 패널 (한국 / 미국)
+    # ──────────────────────────────────────────────
+    def _build_analysis_panels(self, parent: tk.Frame) -> None:
+        tk.Label(
+            parent,
+            text="※ 분석에 투입할 변수를 선택하세요. 체크된 변수만 데이터를 수집합니다."
+                 "  (준비중) 항목은 추후 지원 예정입니다.",
+            font=("맑은 고딕", 8), bg=self.bg_window, fg=self.text_muted, anchor="w",
+        ).pack(fill="x", pady=(8, 0))
+
+        titles = {"kr": "  🇰🇷 한국 시장 분석  ", "us": "  🇺🇸 미국 시장 분석  "}
+        for market in ("kr", "us"):
+            big = tk.LabelFrame(
+                parent, text=titles[market],
+                font=("맑은 고딕", 11, "bold"),
+                bg=self.bg_card, fg=self.text_dark,
+                bd=3, relief="solid", padx=10, pady=8,
+            )
+            big.pack(fill="x", pady=4)
+            self.var_state[market] = {}
+            for catdef in md.VAR_REGISTRY[market]:
+                self._make_category(big, market, catdef)
+
+        save_row = tk.Frame(parent, bg=self.bg_window)
+        save_row.pack(fill="x", pady=(2, 10))
+        tk.Button(
+            save_row, text="💾 변수 선택 저장",
+            font=("맑은 고딕", 9, "bold"),
+            bg=self.primary, fg=self.text_light,
+            bd=0, relief="flat", cursor="hand2", padx=12, pady=5,
+            command=self._save_prefs_now,
+        ).pack(side="right")
+
+    def _make_category(self, parent: tk.Frame, market: str, catdef: dict) -> None:
+        cat   = catdef["cat"]
+        vars_ = catdef["vars"]
+        sub = tk.LabelFrame(
+            parent, text=f"  {catdef['title']}  ",
+            font=("맑은 고딕", 9, "bold"),
+            bg=self.bg_card, fg=self.text_dark,
+            bd=2, relief="groove", padx=8, pady=6,
+        )
+        sub.pack(fill="x", pady=3)
+
+        hdr = tk.Frame(sub, bg=self.bg_card)
+        hdr.pack(fill="x")
+        tk.Button(
+            hdr, text="전체 선택/해제", font=("맑은 고딕", 8),
+            bg=self.bg_input, fg=self.text_dark, bd=1, relief="solid",
+            cursor="hand2", padx=6, pady=1,
+            command=lambda m=market, c=cat: self._toggle_category(m, c),
+        ).pack(side="right")
+
+        grid = tk.Frame(sub, bg=self.bg_card)
+        grid.pack(fill="x", pady=(4, 0))
+
+        self.var_state[market][cat] = {}
+        self._cat_vars[(market, cat)] = []
+
+        maxlen = max((len(v["label"]) for v in vars_), default=0)
+        cols = 2 if maxlen > 16 else 3
+        for c in range(cols):
+            grid.columnconfigure(c, weight=1, uniform="cb")
+
+        for i, v in enumerate(vars_):
+            bv = tk.BooleanVar(value=False)
+            self.var_state[market][cat][v["key"]] = bv
+            soon = (v["status"] != "ok")
+            label = v["label"] + ("  (준비중)" if soon else "")
+            tk.Checkbutton(
+                grid, text=label, variable=bv,
+                font=("맑은 고딕", 9), bg=self.bg_card,
+                fg=self.text_muted if soon else self.text_dark,
+                activebackground=self.bg_card, selectcolor=self.bg_input,
+                anchor="w", justify="left",
+                wraplength=320 if cols == 2 else 210,
+                state="disabled" if soon else "normal",
+            ).grid(row=i // cols, column=i % cols, sticky="w", padx=4, pady=1)
+            if not soon:
+                self._cat_vars[(market, cat)].append(bv)
+
+    def _toggle_category(self, market: str, cat: str) -> None:
+        vars_ = self._cat_vars.get((market, cat), [])
+        if not vars_:
+            return
+        target = not all(bv.get() for bv in vars_)
+        for bv in vars_:
+            bv.set(target)
+
+    def _current_selection(self) -> dict:
+        sel = {}
+        for market, cats in self.var_state.items():
+            sel[market] = {cat: {k: bool(bv.get()) for k, bv in keys.items()}
+                           for cat, keys in cats.items()}
+        return sel
+
+    def _save_prefs_now(self) -> None:
+        prefs.save_prefs(self._current_selection())
+        self._set_status("변수 선택을 저장했습니다.")
+
+    def _restore_prefs(self) -> None:
+        saved = prefs.load_prefs()
+        for market, cats in saved.items():
+            for cat, keys in (cats or {}).items():
+                for k, val in (keys or {}).items():
+                    bv = self.var_state.get(market, {}).get(cat, {}).get(k)
+                    if bv is not None and isinstance(val, bool):
+                        bv.set(val)
 
     # ──────────────────────────────────────────────
     # 실행
@@ -235,8 +423,12 @@ class StockReportSection:
             self._normalize_ticker(t, market)
             for t in raw.split(",") if t.strip()
         ]
-        if not tickers:
-            messagebox.showwarning("입력 오류", "티커를 하나 이상 입력해 주세요.")
+        selection = self._current_selection() if hasattr(self, "var_state") else {}
+        has_macro = md.has_selection(selection)
+        if not tickers and not has_macro:
+            messagebox.showwarning(
+                "입력 오류",
+                "티커를 입력하거나, 한국/미국 분석 변수를 하나 이상 선택해 주세요.")
             return
 
         cfg = load_config()
@@ -245,75 +437,95 @@ class StockReportSection:
                 "Gemini API Key가 설정되지 않았습니다.\n설정 탭에서 입력해 주세요.")
             return
 
+        prefs.save_prefs(selection)   # 실행 시 변수 선택 자동 저장
         self.gen_btn.configure(state="disabled", text="리포트 생성 중... ⏳", bg="#4A4A4A")
         threading.Thread(
-            target=self._run_report, args=(cfg, tickers), daemon=True
+            target=self._run_report, args=(cfg, tickers, selection), daemon=True
         ).start()
 
-    def _run_report(self, cfg: dict, tickers: list) -> None:
+    def _run_report(self, cfg: dict, tickers: list, selection: dict) -> None:
         try:
             print("\n" + "=" * 60)
-            print(f"📈 주식 리포트 시작 — 티커: {', '.join(tickers)}")
+            print(f"📈 주식 리포트 시작 — 티커: "
+                  f"{', '.join(tickers) if tickers else '(거시 변수 단독)'}")
 
             period_label = self.period_var.get()
             yf_period, news_when = PERIOD_PRESETS.get(period_label, ("1mo", "14d"))
             market = self.market_var.get()
-
-            # 1) 가격 데이터 수집
-            self._set_status("가격 데이터 수집 중...")
-            price_rows, price_series = self._collect_prices(tickers, yf_period, market)
-            if not price_rows:
-                raise RuntimeError("가격 데이터를 가져오지 못했습니다. 티커를 확인하세요.")
-
-            # 2) 뉴스 수집
-            self._set_status("뉴스 헤드라인 수집 중...")
-            news_map = self._collect_news(price_rows, market, news_when)
-
-            # 3) 차트 생성
-            self._set_status("그래프 생성 중...")
             now = datetime.now(KST)
             desktop    = _get_desktop()
             charts_dir = desktop / "lists" / "charts"
             charts_dir.mkdir(parents=True, exist_ok=True)
             stamp = now.strftime("%Y-%m-%d_%H-%M")
-            line_png = charts_dir / f"price_{stamp}.png"
-            bar_png  = charts_dir / f"return_{stamp}.png"
-            # 두 그래프에서 종목별로 동일한 색을 쓰도록 색상 맵 구성
-            color_map = {
-                r["symbol"]: PALETTE[i % len(PALETTE)]
-                for i, r in enumerate(price_rows)
-            }
-            # 그래프 라벨: 한글 종목명만 사용 (코드 제외)
-            name_map = {r["symbol"]: r["name"] for r in price_rows}
-            self._make_line_chart(price_series, line_png, period_label, color_map, name_map)
-            self._make_bar_chart(price_rows, bar_png, period_label, color_map, name_map)
 
-            # 3-1) 시장 지수 스냅샷
-            self._set_status("시장 지수 데이터 수집 중...")
-            try:
-                index_data = self._collect_market_data(market)
-                print("  ✓ 시장 지수 완료")
-            except Exception as _me:
-                index_data = []
-                print(f"  [경고] 시장 지수 생략: {_me}")
+            price_rows, price_series, news_map = [], {}, {}
+            line_png = bar_png = None
+            index_data = []
 
-            # 4) Gemini 분석
+            # 1) 티커/키워드가 있을 때 가격·뉴스·차트 수집
+            if tickers:
+                valid_tickers = [t for t in tickers if self._is_valid_ticker(t, market)]
+                keyword_tickers = [t for t in tickers if not self._is_valid_ticker(t, market)]
+                
+                if valid_tickers:
+                    self._set_status("가격 데이터 수집 중...")
+                    price_rows, price_series = self._collect_prices(valid_tickers, yf_period, market)
+                    if not price_rows and not keyword_tickers:
+                        raise RuntimeError("가격 데이터를 가져오지 못했습니다. 티커를 확인하세요.")
+                elif not keyword_tickers:
+                    raise RuntimeError("유효한 티커나 키워드가 없습니다.")
+
+                self._set_status("뉴스 헤드라인 수집 중...")
+                news_map = self._collect_news(price_rows, keyword_tickers, market, news_when)
+
+                if price_rows:
+                    self._set_status("그래프 생성 중...")
+                    line_png = charts_dir / f"price_{stamp}.png"
+                    bar_png  = charts_dir / f"return_{stamp}.png"
+                    color_map = {r["symbol"]: PALETTE[i % len(PALETTE)]
+                                 for i, r in enumerate(price_rows)}
+                    name_map = {r["symbol"]: r["name"] for r in price_rows}
+                    self._make_line_chart(price_series, line_png, period_label, color_map, name_map)
+                    self._make_bar_chart(price_rows, bar_png, period_label, color_map, name_map)
+
+                self._set_status("시장 지수 데이터 수집 중...")
+                try:
+                    index_data = self._collect_market_data(market)
+                    print("  ✓ 시장 지수 완료")
+                except Exception as _me:
+                    index_data = []
+                    print(f"  [경고] 시장 지수 생략: {_me}")
+
+            # 2) 거시 분석 변수 수집 (체크된 변수만)
+            macro = {"kr": [], "us": []}
+            if md.has_selection(selection):
+                self._set_status("거시 분석 변수 수집 중...")
+                macro = md.collect_selected(selection)
+                n = sum(len(c["rows"]) for mk in macro.values() for c in mk)
+                print(f"  ✓ 거시 변수 {n}개 수집 완료")
+
+            # 3) Gemini 분석 (한·미 교차 해석 포함)
             self._set_status("Gemini 종합 분석 중...")
             analysis = self._gen_analysis(
-                cfg, price_rows, news_map, period_label, market, self.news_filter_var.get()
-            )
+                cfg, price_rows, news_map, period_label, market,
+                self.news_filter_var.get(), macro)
 
-            # 5) HTML 리포트 저장 (파일명에 한글 종목명 포함)
+            # 4) HTML 리포트 저장
             self._set_status("HTML 리포트 저장 중...")
             lists_dir = desktop / "lists"
             lists_dir.mkdir(parents=True, exist_ok=True)
-            names_label = self._filename_names(price_rows)
+            if price_rows:
+                names_label = self._filename_names(price_rows)
+            elif keyword_tickers:
+                shown = [re.sub(r'[\\/:*?"<>|]', "", k).strip() for k in keyword_tickers[:3]]
+                names_label = "·".join(shown)[:80]
+            else:
+                names_label = "시장거시분석"
             html_path = lists_dir / f"{stamp} 주식리포트 {names_label}.html"
             self._write_html(
                 html_path, price_rows, news_map, analysis,
                 line_png, bar_png, index_data, period_label, market, now,
-                self.news_filter_var.get()
-            )
+                self.news_filter_var.get(), macro)
 
             fp = str(html_path)
             self.last_html_path = fp
@@ -438,6 +650,25 @@ class StockReportSection:
                 if hist is None or hist.empty:
                     print(f"  [경고] {sym}: 데이터 없음 (건너뜀)")
                     continue
+
+                now_kst = datetime.now(KST)
+                if market == "🇺🇸 미국":
+                    now_market = self._kst_to_et(now_kst)
+                    open_time = dtime(9, 30)
+                else:
+                    now_market = now_kst.replace(tzinfo=None)
+                    open_time = dtime(9, 0)
+                
+                is_weekday = now_market.weekday() < 5
+                is_pre_market = is_weekday and (now_market.time() < open_time)
+                
+                if yf_period == "5d" and is_pre_market:
+                    today_market_date = self._get_market_date(now_kst, market)
+                    last_row_dt = hist.index[-1].to_pydatetime()
+                    last_row_market_date = self._get_market_date(last_row_dt, market)
+                    if last_row_market_date == today_market_date:
+                        hist = hist.iloc[:-1]
+
                 tk_obj = yf.Ticker(sym)
 
                 close = hist["Close"].dropna()
@@ -538,6 +769,26 @@ class StockReportSection:
         except Exception:
             return sym
 
+    def _is_valid_ticker(self, sym: str, market: str) -> bool:
+        sym = sym.strip()
+        if market == "🇰🇷 한국":
+            return bool(re.fullmatch(r"\d{4,6}(\.(KS|KQ))?", sym, re.IGNORECASE))
+        else: # "🇺🇸 미국"
+            return bool(re.fullmatch(r"[A-Z0-9.\-]+", sym))
+
+    def _get_market_date(self, dt: datetime, market: str) -> date:
+        if market == "🇺🇸 미국":
+            if dt.tzinfo is not None:
+                dt_utc = dt.astimezone(timezone.utc)
+            else:
+                dt_utc = dt.replace(tzinfo=timezone.utc)
+            dt_kst = dt_utc.astimezone(KST)
+            return self._kst_to_et(dt_kst).date()
+        else:
+            if dt.tzinfo is not None:
+                return dt.astimezone(KST).date()
+            return dt.date()
+
     def _is_market_active(self, market: str) -> bool:
         now_kst = datetime.now(KST)
         is_weekday = now_kst.weekday() < 5
@@ -556,7 +807,7 @@ class StockReportSection:
     def _on_market_change(self, event=None):
         market = self.market_var.get()
         is_active = self._is_market_active(market)
-        self.news_filter_var.set("장중" if is_active else "장후")
+        self.period_var.set("장중" if is_active else "장전후")
 
     def _fmt_dt(self, ts, market: str = "🇰🇷 한국") -> str:
         """최종 거래일 + 시간으로 표기.
@@ -613,45 +864,35 @@ class StockReportSection:
         elif filter_type == "24시간":
             return now - timedelta(hours=24) <= dt <= now
             
-        # 2. 거래 세션 기반 필터
-        try:
-            last_date = datetime.strptime(last_dt_str[:10], "%Y-%m-%d").date()
-        except Exception:
-            last_date = now.date()
-            
-        if market == "🇺🇸 미국":
-            dt_local = self._kst_to_et(dt)
-            open_time = datetime.combine(last_date, dtime(9, 30))
-            close_time = datetime.combine(last_date, dtime(16, 0))
-            prev_close_time = datetime.combine(last_date - timedelta(days=4), dtime(16, 0))
-            
-            if filter_type == "장전":
-                return prev_close_time <= dt_local < open_time
-            elif filter_type == "장중":
-                return open_time <= dt_local <= close_time
-            elif filter_type == "장후":
-                return dt_local > close_time
-        else: # "🇰🇷 한국"
-            dt_local = dt.astimezone(KST).replace(tzinfo=None)
-            open_time = datetime.combine(last_date, dtime(9, 0))
-            close_time = datetime.combine(last_date, dtime(15, 30))
-            prev_close_time = datetime.combine(last_date - timedelta(days=4), dtime(15, 30))
-            
-            if filter_type == "장전":
-                return prev_close_time <= dt_local < open_time
-            elif filter_type == "장중":
-                return open_time <= dt_local <= close_time
-            elif filter_type == "장후":
-                return dt_local > close_time
-                
-        return False
+        return True
 
-    def _collect_news(self, price_rows: list, market: str, when: str) -> dict:
-        """종목별 구글 뉴스 RSS 헤드라인 수집 → {symbol: [기사,...]}.
-        선택한 뉴스 필터 조건에 부합하는 뉴스만 남긴다."""
+    def _collect_news(self, price_rows: list, keyword_tickers: list, market: str, when: str) -> dict:
+        """종목별/키워드별 구글 뉴스 RSS 헤드라인 수집 → {symbol: [기사,...]}."""
         hl, gl, ceid = MARKET_PRESETS.get(market, MARKET_PRESETS["🇰🇷 한국"])
         out = {}
         filter_type = self.news_filter_var.get()
+        period_label = self.period_var.get()
+        
+        now = datetime.now(KST)
+        if market == "🇺🇸 미국":
+            now_market = self._kst_to_et(now)
+            open_time = dtime(9, 30)
+            close_time = dtime(16, 0)
+        else: # "🇰🇷 한국"
+            now_market = now.replace(tzinfo=None)
+            open_time = dtime(9, 0)
+            close_time = dtime(15, 30)
+            
+        is_weekday = now_market.weekday() < 5
+        is_pre_market = is_weekday and (now_market.time() < open_time)
+        
+        if is_pre_market:
+            days_to_sub = 3 if now_market.weekday() == 0 else 1
+            target_date_fallback = (now_market - timedelta(days=days_to_sub)).date()
+        else:
+            target_date_fallback = now_market.date()
+
+        # 1) 종목별 뉴스 수집 (yfinance 데이터가 존재하는 종목)
         for row in price_rows:
             sym = row["symbol"]
             name = row["name"]
@@ -664,12 +905,82 @@ class StockReportSection:
             )
             try:
                 items = self._fetch_rss(url)
-                fresh = [h for h in items if h.get("dt") and self._is_in_filter(h["dt"], filter_type, market, row["last_dt"])]
+                try:
+                    last_date = datetime.strptime(row["last_dt"][:10], "%Y-%m-%d").date()
+                except Exception:
+                    last_date = target_date_fallback
+                    
+                fresh = []
+                for h in items:
+                    if not h.get("dt"):
+                        continue
+                        
+                    if period_label in ["장전후", "장중"]:
+                        if market == "🇺🇸 미국":
+                            dt_local = self._kst_to_et(h["dt"])
+                        else:
+                            dt_local = h["dt"].astimezone(KST).replace(tzinfo=None)
+                            
+                        if dt_local.date() != last_date:
+                            continue
+                            
+                        if period_label == "장전후":
+                            if not (dt_local.time() < open_time or dt_local.time() > close_time):
+                                continue
+                        elif period_label == "장중":
+                            if not (open_time <= dt_local.time() <= close_time):
+                                continue
+                    else:
+                        if not self._is_in_filter(h["dt"], filter_type, market, row["last_dt"]):
+                            continue
+                            
+                    fresh.append(h)
                 out[sym] = fresh[:6]
-                print(f"  ✓ {sym} 뉴스 필터({filter_type}) 적용 후 뉴스 {len(out[sym])}건")
+                print(f"  ✓ {sym} 뉴스 필터({period_label if period_label in ['장전후', '장중'] else filter_type}) 적용 후 뉴스 {len(out[sym])}건")
             except Exception as e:
                 print(f"  [경고] {sym} 뉴스 수집 실패: {e}")
                 out[sym] = []
+
+        # 2) 키워드 중심 뉴스 수집 (가격 시세 수집이 불가능한 일반 검색어)
+        for kw in keyword_tickers:
+            q = f"{kw} when:{when}" if when else kw
+            url = (
+                f"https://news.google.com/rss/search?q={quote(q)}"
+                f"&hl={hl}&gl={gl}&ceid={ceid}"
+            )
+            try:
+                items = self._fetch_rss(url)
+                fresh = []
+                for h in items:
+                    if not h.get("dt"):
+                        continue
+                        
+                    if period_label in ["장전후", "장중"]:
+                        if market == "🇺🇸 미국":
+                            dt_local = self._kst_to_et(h["dt"])
+                        else:
+                            dt_local = h["dt"].astimezone(KST).replace(tzinfo=None)
+                            
+                        if dt_local.date() != target_date_fallback:
+                            continue
+                            
+                        if period_label == "장전후":
+                            if not (dt_local.time() < open_time or dt_local.time() > close_time):
+                                continue
+                        elif period_label == "장중":
+                            if not (open_time <= dt_local.time() <= close_time):
+                                continue
+                    else:
+                        if not self._is_in_filter(h["dt"], filter_type, market, now.strftime("%Y-%m-%d %H:%M")):
+                            continue
+                            
+                    fresh.append(h)
+                out[kw] = fresh[:6]
+                print(f"  ✓ '{kw}' 뉴스 필터({period_label if period_label in ['장전후', '장중'] else filter_type}) 적용 후 뉴스 {len(out[kw])}건")
+            except Exception as e:
+                print(f"  [경고] '{kw}' 뉴스 수집 실패: {e}")
+                out[kw] = []
+
         return out
 
     def _fetch_rss(self, url: str) -> list:
@@ -727,6 +1038,27 @@ class StockReportSection:
         index_data = []
         for name, sym in idx_cfg:
             try:
+                if market == "🇰🇷 한국":
+                    code_map = {"^KS11": "KOSPI", "^KQ11": "KOSDAQ", "^KS200": "KPI200"}
+                    q = md._fetch_naver_index(code_map[sym])
+                    if q:
+                        index_data.append({"name": name, "last": q["last"], "diff": q["diff"], "pct": q["pct"]})
+                        continue
+
+                if market == "🇺🇸 미국" and self._is_market_active(market):
+                    try:
+                        tk = yf.Ticker(sym)
+                        fast = tk.fast_info
+                        if fast and getattr(fast, "last_price", None) is not None:
+                            last = float(fast.last_price)
+                            prev = float(getattr(fast, "previous_close", last))
+                            diff = last - prev
+                            pct = (diff / prev * 100) if prev else 0
+                            index_data.append({"name": name, "last": last, "diff": diff, "pct": pct})
+                            continue
+                    except Exception as fe:
+                        print(f"  [경고] {name} 지수 실시간 수집 실패: {fe}")
+
                 h = yf.Ticker(sym).history(period="5d", interval="1d", auto_adjust=False)
                 if h is not None and len(h) >= 2:
                     prev = float(h["Close"].iloc[-2])
@@ -894,20 +1226,51 @@ class StockReportSection:
     # ──────────────────────────────────────────────
     # Gemini 분석
     # ──────────────────────────────────────────────
-    def _gen_analysis(self, cfg, price_rows, news_map, period_label, market, news_filter) -> str:
+    def _fmt_quote(self, q: dict, fmt: str) -> tuple:
+        """거시 변수 quote → (현재값 문자열, 변동 문자열)."""
+        if not q:
+            return ("데이터 없음", "-")
+        last, diff, pct = q["last"], q["diff"], q["pct"]
+        if fmt == "pct":   # 금리(%) 지표
+            return (f"{last:.2f}%", f"{diff:+.2f}%p ({pct:+.2f}%)")
+        return (f"{last:,.2f}", f"{diff:+,.2f} ({pct:+.2f}%)")
+
+    def _macro_to_text(self, macro: dict) -> str:
+        """거시 변수 수집 결과 → 프롬프트용 텍스트."""
+        names = {"kr": "한국", "us": "미국"}
+        lines = []
+        for mk in ("kr", "us"):
+            cats = macro.get(mk, [])
+            if not cats:
+                continue
+            lines.append(f"\n[{names[mk]} 시장 거시 변수]")
+            for cat in cats:
+                lines.append(f"({cat['title']})")
+                for r in cat["rows"]:
+                    val, chg = self._fmt_quote(r["quote"], r["fmt"])
+                    lines.append(f"  · {r['label']}: {val}  변동 {chg}")
+        return "\n".join(lines) or "(선택된 거시 변수 없음)"
+
+    def _gen_analysis(self, cfg, price_rows, news_map, period_label, market,
+                      news_filter, macro=None) -> str:
         model_id = cfg.get("gemini_model", "gemini-3.1-flash-lite")
         client   = genai.Client(api_key=cfg["gemini_api_key"])
+        macro = macro or {"kr": [], "us": []}
+        has_macro = any(macro.get(mk) for mk in ("kr", "us"))
 
         is_us = (market == "🇺🇸 미국")
         def pfmt(v): return f"{v:,.2f}" if is_us else f"{v:,.0f}"
 
-        price_txt = "\n".join(
-            f"- {r['name']}({r['symbol']}): "
-            f"현재 종가 {pfmt(r['last'])} (장 최종 {r['last_dt']}), "
-            f"일간 {r['day_chg']:+.2f}%, 기간 {r['period_chg']:+.2f}%, "
-            f"기간고가 {pfmt(r['high'])}, 기간저가 {pfmt(r['low'])}"
-            for r in price_rows
-        )
+        if price_rows:
+            price_txt = "\n".join(
+                f"- {r['name']}({r['symbol']}): "
+                f"현재 종가 {pfmt(r['last'])} (장 최종 {r['last_dt']}), "
+                f"일간 {r['day_chg']:+.2f}%, 기간 {r['period_chg']:+.2f}%, "
+                f"기간고가 {pfmt(r['high'])}, 기간저가 {pfmt(r['low'])}"
+                for r in price_rows
+            )
+        else:
+            price_txt = "(개별 종목 미선택 — 시장 거시 변수 중심 분석)"
         news_txt = ""
         for r in price_rows:
             sym = r["symbol"]
@@ -915,25 +1278,86 @@ class StockReportSection:
             news_txt += f"\n[{r['name']}({sym}) 뉴스]\n"
             news_txt += "\n".join(f"  · ({h['date']}) {h['title']}" for h in heads) or "  · (뉴스 없음)"
             news_txt += "\n"
+        
+        # 기사 정보에 참조 키워드 관련 뉴스 추가
+        price_symbols = {r["symbol"] for r in price_rows}
+        for kw, heads in news_map.items():
+            if kw not in price_symbols:
+                news_txt += f"\n[{kw} (참조 키워드) 뉴스]\n"
+                news_txt += "\n".join(f"  · ({h['date']}) {h['title']}" for h in heads) or "  · (뉴스 없음)"
+                news_txt += "\n"
+        macro_txt = self._macro_to_text(macro)
 
-        price_rule = "- 미국 주식 시황 분석 시 본문에 인용하는 모든 주가 수치(달러)는 반드시 소수점 두 자리까지 정확히 표기할 것 (예: $125.43 또는 125.43달러)" if is_us else "- 한국 주식 분석 시 본문에 인용하는 주가는 소수점 없이 원화 정수로 표기할 것 (예: 72,500원)"
+        # 현재 시장 상태(장전, 장중, 장후) 파악 및 지침 구성
+        now_kst = datetime.now(KST)
+        if market == "🇺🇸 미국":
+            now_market = self._kst_to_et(now_kst)
+            open_time = dtime(9, 30)
+            close_time = dtime(16, 0)
+        else: # "🇰🇷 한국"
+            now_market = now_kst.replace(tzinfo=None)
+            open_time = dtime(9, 0)
+            close_time = dtime(15, 30)
+            
+        is_weekday = now_market.weekday() < 5
+        
+        if not is_weekday:
+            state_label = "장후"
+        elif now_market.time() < open_time:
+            state_label = "장전"
+        elif open_time <= now_market.time() <= close_time:
+            state_label = "장중"
+        else:
+            state_label = "장후"
+            
+        if state_label == "장전":
+            state_rule = (
+                f"\n- [장 상태 지침] 현재 {market} 시장은 개장 전(장전)입니다. 아직 오늘 장이 열리지 않았으므로, "
+                f"오늘 개장할 {market} 시장 및 개별 종목에 대해서는 기정사실화된 어조(예: '반영하지 못하고 하락했습니다')로 서술해서는 절대로 안 되며, "
+                f"반드시 '금일 강세 출발이 예상된다', '~의 영향으로 변동성이 커질 것으로 전망/기대된다'와 같이 "
+                f"전망과 기대 중심의 예측형 어조로 서술하십시오."
+            )
+        elif state_label == "장중":
+            state_rule = (
+                f"\n- [장 상태 지침] 현재 {market} 시장은 정규장 거래 시간 중(장중)입니다. 아직 장이 마감되지 않았으므로, "
+                f"오늘 {market} 시장의 실시간 가격 변동 및 움직임을 서술할 때 '마감했습니다', '종가로 마쳤습니다', '장을 마쳤습니다'와 같은 완료형 종가 서술어는 절대 사용하지 마십시오. "
+                f"대신 '현재 상승/하락 진행 중이다', '장중 강세/약세를 기록하고 있다'와 같이 현재 진행형(실시간 흐름) 어조로 서술하십시오."
+            )
+        else:
+            state_rule = (
+                f"\n- [장 상태 지침] 현재 {market} 시장은 장마감 후(장후) 또는 휴장일입니다. "
+                f"오늘/최근의 실제 시장 최종 결과를 바탕으로 '상승 마감했습니다', '종가 기준 하락했습니다'와 같이 완료된 결과 및 사실 기반으로 서술하십시오."
+            )
+
+        price_rule = "- 미국 주식 시황 분석 시 본문에 인용하는 개별 종목 주가(달러)는 반드시 소수점 두 자리까지 정확히 표기할 것 (예: $125.43 또는 125.43달러). 단, 지수(S&P 500, SOX, 나스닥 등)는 원화나 달러 단위를 붙이지 않고 포인트 또는 소수점/정수 수치만 단독으로 표기할 것." if is_us else "- 한국 주식 분석 시 본문에 인용하는 개별 종목 주가는 소수점 없이 원화 정수로 표기할 것 (예: 72,500원). 단, 지수(코스피, 나스닥, SOX 등)는 원화 단위를 절대 붙이지 않고 포인트 또는 소수점/정수 수치만 단독으로 표기할 것."
+
+        cross_rule = ""
+        if has_macro:
+            cross_rule = (
+                "\n- [한·미 교차 분석] 문단을 반드시 별도로 포함하라. 제공된 한국·미국 거시 변수를 "
+                "교차 해석하되 최소한 다음 상관관계를 데이터로 짚어라: "
+                "필라델피아 반도체지수(SOX)↔KOSPI 반도체주, 달러인덱스(DXY)↔원/달러 환율, "
+                "미국채 10년물 금리↔성장주(나스닥/코스닥). 수치 근거를 들어 방향성을 설명할 것."
+            )
 
         sys_inst = f"""당신은 증권 시황 분석 전문 에디터입니다.
-제공된 가격 데이터와 뉴스 헤드라인을 바탕으로 한국어 시황 분석 리포트를 작성하세요.
+제공된 가격 데이터·뉴스 헤드라인·시장 거시 변수를 바탕으로 한국어 시황 분석 리포트를 작성하세요.
 규칙:
 - 본문에 쓰는 모든 가격 수치는 반드시 '종가(close)' 기준으로 작성 (장중가·시가 사용 금지)
 - 종목명은 반드시 제공된 한글 종목명으로 표기 (종목 코드 단독 표기 금지)
-- 반드시 제공된 수치(시작종가, 현재 종가, 등락률 등)를 인용해 근거를 제시
+- 반드시 제공된 수치(시작종가, 현재 종가, 등락률, 거시 변수 값 등)를 인용해 근거를 제시
 {price_rule}
-- 뉴스 헤드라인과 가격 흐름을 연결해 해석
+{state_rule}
+- 뉴스 헤드라인과 가격 흐름을 연결해 해석{cross_rule}
 - 과장·투자 권유 금지, 객관적 사실 기반
 - 마크다운/코드블록 없이 일반 문단 텍스트로만 출력
-- 종목 종합 요약 → 종목별 코멘트 → 유의점 순서, 800~1200자"""
+- 시장 종합 요약 → (종목 선택 시) 종목별 코멘트 → 한·미 교차 분석 → 유의점 순서, 900~1400자"""
 
         user = (
             f"시장: {market}, 분석 기간: {period_label}, 뉴스 시간대 필터: {news_filter}\n\n"
             f"[가격 데이터]\n{price_txt}\n\n"
             f"[뉴스 헤드라인]\n{news_txt}\n\n"
+            f"[시장 거시 변수]\n{macro_txt}\n\n"
             "위 데이터를 바탕으로 시황 분석 리포트를 작성해 주세요."
         )
         resp = client.models.generate_content(
@@ -949,8 +1373,10 @@ class StockReportSection:
     # HTML 출력
     # ──────────────────────────────────────────────
     def _write_html(self, path, price_rows, news_map, analysis,
-                    line_png, bar_png, index_data, period_label, market, now, news_filter) -> None:
+                    line_png, bar_png, index_data, period_label, market, now,
+                    news_filter, macro=None) -> None:
         esc = html.escape
+        macro = macro or {"kr": [], "us": []}
 
         is_active = self._is_market_active(market)
         title_prefix = "실시간 시세" if is_active else "당일 시세"
@@ -1077,6 +1503,29 @@ class StockReportSection:
                     "</tr>"
                 )
 
+        # 키워드별 뉴스 표
+        keyword_news_trs = ""
+        price_symbols = {r["symbol"] for r in price_rows}
+        for kw, heads in news_map.items():
+            if kw in price_symbols:
+                continue
+            if not heads:
+                keyword_news_trs += f"<tr><td><b>{esc(kw)}</b></td><td colspan='2'>(뉴스 없음)</td></tr>"
+                continue
+            for i, h in enumerate(heads):
+                first = (
+                    f"<td rowspan='{len(heads)}'><b>{esc(kw)}</b></td>"
+                    if i == 0 else ""
+                )
+                link = esc(h["link"])
+                keyword_news_trs += (
+                    "<tr>"
+                    f"{first}"
+                    f"<td class='date'>{esc(h['date'])}</td>"
+                    f"<td><a href='{link}' target='_blank'>{esc(h['title'])}</a></td>"
+                    "</tr>"
+                )
+
         analysis_html = ""
         for p in analysis.split("\n"):
             p_clean = p.strip()
@@ -1091,6 +1540,95 @@ class StockReportSection:
                 p_html = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', p_html)
                 p_html = re.sub(r'\*(.*?)\*', r'<i>\1</i>', p_html)
                 analysis_html += f"<p>{p_html}</p>"
+
+        # ── 장 상태 헤더 ──
+        krl, krd, kr_live = md.kr_status(now)
+        usl, usd, us_live = md.us_status(now)
+        status_html = (
+            "<div class='status'>"
+            f"🇰🇷 <b>한국</b>: {esc(krl)} · {esc(krd)} · "
+            f"{'실시간' if kr_live else '전일/마감 데이터'}<br>"
+            f"🇺🇸 <b>미국</b>: {esc(usl)} · {esc(usd)} · "
+            f"{'실시간' if us_live else '마감 데이터'}"
+            "</div>"
+        )
+
+        # ── 거시 변수 표 (카테고리별) ──
+        def macro_tables(cats):
+            out = ""
+            for cat in cats:
+                trs = ""
+                for r in cat["rows"]:
+                    q = r["quote"]
+                    val, chg = self._fmt_quote(q, r["fmt"])
+                    if not q:
+                        cc, arrow = "#999999", ""
+                    else:
+                        up = q["pct"] >= 0
+                        cc, arrow = (("#E63B2E", "▲") if up else ("#0055FF", "▼"))
+                    asof = q["asof"] if q else "-"
+                    trs += (
+                        f"<tr><td><b>{esc(r['label'])}</b></td>"
+                        f"<td class='num'>{esc(val)}</td>"
+                        f"<td class='num' style='color:{cc}'>{arrow} {esc(chg)}</td>"
+                        f"<td class='num'>{esc(asof)}</td></tr>"
+                    )
+                out += (
+                    f"<h3>{esc(cat['title'])}</h3>"
+                    "<table><tr><th>지표</th><th>현재값</th><th>변동</th>"
+                    "<th>기준일</th></tr>"
+                    f"{trs}</table>"
+                )
+            return out
+
+        # ── 본문 섹션 동적 구성 (티커/거시 선택에 따라) ──
+        _circ = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫"
+        _n = [0]
+        def H2(title, extra=""):
+            _n[0] += 1
+            mark = _circ[_n[0] - 1] if _n[0] <= len(_circ) else str(_n[0])
+            return f"<h2>{mark} {title} {extra}</h2>"
+
+        sections = [status_html]
+
+        if price_rows:
+            sections.append(
+                H2(title_prefix,
+                   f"<span style='font-size:13px;font-weight:normal;'>"
+                   f"({market_label} {title_suffix})</span>")
+                + idx_boxes_html + quote_cards)
+            sections.append(
+                H2(market_summary_name,
+                   f"&nbsp;|&nbsp; 분석 기간: {esc(period_label)}")
+                + f"<p style='font-size:14px;font-weight:bold;margin:6px 0 10px 0;'>"
+                  f"장 최종 일시: {esc(last_dt_label)}</p>"
+                + "<table><tr><th>종목</th><th>현재 종가</th><th>일간</th>"
+                  "<th>기간등락</th><th>기간고가</th><th>기간저가</th><th>거래량</th></tr>"
+                + price_trs + "</table>")
+            if line_png is not None and bar_png is not None:
+                sections.append(
+                    H2("추이 그래프")
+                    + f"<img src='charts/{line_png.name}' alt='가격 추이'>"
+                      f"<img src='charts/{bar_png.name}' alt='기간 등락률'>")
+            if news_trs:
+                sections.append(
+                    H2("종목별 뉴스")
+                    + "<table><tr><th>종목</th><th>날짜</th><th>헤드라인</th></tr>"
+                    + news_trs + "</table>")
+
+        if keyword_news_trs:
+            sections.append(
+                H2("키워드 중심 뉴스")
+                + "<table><tr><th>키워드</th><th>날짜</th><th>헤드라인</th></tr>"
+                + keyword_news_trs + "</table>")
+
+        if macro.get("kr"):
+            sections.append(H2("한국 시장 거시지표") + macro_tables(macro["kr"]))
+        if macro.get("us"):
+            sections.append(H2("미국 시장 거시지표") + macro_tables(macro["us"]))
+
+        sections.append(H2("종합 분석 (한·미 교차 해석)") + analysis_html)
+        body = "\n".join(sections)
 
         doc = f"""<!DOCTYPE html>
 <html lang="ko"><head><meta charset="utf-8">
@@ -1111,47 +1649,17 @@ class StockReportSection:
   .sym {{ color:#0055FF; font-size:11px; font-family:Consolas,monospace; }}
   img {{ width:100%; border:3px solid #1A1A1A; margin:12px 0; background:#fff; }}
   .meta {{ color:#4A4A4A; font-size:13px; }}
+  .status {{ background:#fff; border:3px solid #1A1A1A; padding:10px 14px;
+             margin:12px 0; font-size:14px; line-height:1.7; }}
   a {{ color:#0055FF; text-decoration:none; }}
   a:hover {{ text-decoration:underline; }}
   p {{ line-height:1.7; }}
-  .quote {{ background:#fff; border:3px solid #1A1A1A; margin:12px 0; padding:12px 16px; }}
-  .qhead {{ font-size:15px; border-bottom:2px solid #1A1A1A; padding-bottom:6px; }}
-  .qhead .qdate {{ float:right; color:#4A4A4A; font-size:12px; font-weight:normal; }}
-  .qprice {{ font-size:30px; font-weight:bold; margin:8px 0;
-             font-variant-numeric:tabular-nums; }}
-  .qprice .qdiff {{ font-size:14px; margin-left:10px; }}
-  .qtable {{ border:none; margin:0; width:100%; }}
-  .qtable th {{ background:#F5F0E8; color:#1A1A1A; text-align:left;
-                width:80px; font-size:13px; border:1px solid #ddd; }}
-  .qtable td {{ border:1px solid #ddd; }}
 </style></head><body>
 <h1>📈 주식 / ETF 뉴스 리포트</h1>
 <p class="meta">시장: {esc(market)} &nbsp;|&nbsp; 분석 기간: {esc(period_label)} &nbsp;|&nbsp; 뉴스 필터: {esc(news_filter)}
 &nbsp;|&nbsp; 작성: {now.strftime('%Y-%m-%d %H:%M')} (KST)</p>
 
-<h2>① {title_prefix} <span style="font-size:13px;font-weight:normal;">({market_label} {title_suffix})</span></h2>
-{idx_boxes_html}
-{quote_cards}
-
-<h2>② {market_summary_name} &nbsp;|&nbsp; 분석 기간: {esc(period_label)}</h2>
-<p style="font-size:14px; font-weight:bold; color:#1A1A1A; margin:6px 0 10px 0;">장 최종 일시: {esc(last_dt_label)}</p>
-<table>
-<tr><th>종목</th><th>현재 종가</th><th>일간</th><th>기간등락</th><th>기간고가</th><th>기간저가</th><th>거래량</th></tr>
-{price_trs}
-</table>
-
-<h2>③ 추이 그래프</h2>
-<img src="charts/{line_png.name}" alt="가격 추이">
-<img src="charts/{bar_png.name}" alt="기간 등락률">
-
-<h2>④ 종목별 뉴스</h2>
-<table>
-<tr><th>종목</th><th>날짜</th><th>헤드라인</th></tr>
-{news_trs}
-</table>
-
-<h2>⑤ 종합 분석</h2>
-{analysis_html}
+{body}
 
 <p class="meta" style="margin-top:32px;">
 ※ 데이터 출처: Yahoo Finance(yfinance), 구글 뉴스 RSS.
