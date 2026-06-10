@@ -795,9 +795,6 @@ class NaverPosterGUI:
         if not file_path:
             return
         cfg = load_config()
-        if not cfg.get("gemini_api_key"):
-            messagebox.showwarning("설정 오류", "해시태그 분석을 위해 Gemini API Key가 필요합니다. 설정 탭에서 입력해 주세요.")
-            return
         self.import_btn.configure(state="disabled", text="불러오는 중... ⏳", bg=self.gray)
         
         def run():
@@ -815,9 +812,6 @@ class NaverPosterGUI:
     def _load_report_to_blog(self, file_path: str) -> None:
         """주식 리포트 탭 [📤 발행] 버튼에서 자동 호출. 블로그 탭으로 전환 후 HTML 로드."""
         cfg = load_config()
-        if not cfg.get("gemini_api_key"):
-            messagebox.showwarning("설정 오류", "해시태그 분석을 위해 Gemini API Key가 필요합니다. 설정 탭에서 입력해 주세요.")
-            return
         # 블로그 탭(인덱스 0)으로 전환
         self.notebook.select(0)
         self.import_btn.configure(state="disabled", text="리포트 불러오는 중... ⏳", bg=self.gray)
@@ -850,38 +844,55 @@ class NaverPosterGUI:
             flags=re.DOTALL | re.IGNORECASE
         )
 
-        _, plain_content = utils.parse_html_report(html_content)
+        parsed_title, plain_content = utils.parse_html_report(html_content)
         
-        # 제목 생성 (2026년 6월 10일 형식 + 핵심 어휘, 2/3 길이)
-        print("[AI 제목] 본문에서 블로그 제목 생성 시작...")
+        # 제목 및 해시태그 결정 (실패 시 원본/기본 정보 폴백)
+        title = parsed_title
+        tags = ""
         model_id = cfg.get("gemini_model", DEFAULT_MODEL)
-        title = gemini_service.generate_report_title(cfg["gemini_api_key"], model_id, plain_content)
-        print(f"✅ AI 제목 생성 완료! 제목: {title} / 본문: 약 {len(plain_content)}자")
+        
+        if cfg.get("gemini_api_key"):
+            try:
+                # 제목 생성 (2026년 6월 10일 형식 + 핵심 어휘, 2/3 길이)
+                print("[AI 제목] 본문에서 블로그 제목 생성 시작...")
+                title = gemini_service.generate_report_title(cfg["gemini_api_key"], model_id, plain_content)
+                print(f"✅ AI 제목 생성 완료! 제목: {title} / 본문: 약 {len(plain_content)}자")
+            except Exception as e:
+                print(f"[경고] AI 제목 생성 실패 (원본 제목 사용): {e}")
+                title = parsed_title
 
-        # 해시태그 생성 (12~15개)
-        print("[AI 태그] 본문에서 해시태그 선정 시작...")
-        tags = gemini_service.generate_hashtags(cfg["gemini_api_key"], model_id, plain_content)
-        print(f"✅ 해시태그 선정 완료: {tags}")
+            try:
+                # 해시태그 생성 (12~15개)
+                print("[AI 태그] 본문에서 해시태그 선정 시작...")
+                tags = gemini_service.generate_hashtags(cfg["gemini_api_key"], model_id, plain_content)
+                print(f"✅ 해시태그 선정 완료: {tags}")
+            except Exception as e:
+                print(f"[경고] AI 해시태그 생성 실패: {e}")
+                tags = "#주식시황 #증시분석"
+        else:
+            print("[정보] Gemini API Key가 없어 원본 제목 및 기본 태그를 사용합니다.")
+            tags = "#주식시황 #증시분석"
 
         # 평문 미리보기에도 해시태그 추가
         plain_content_with_tags = f"{plain_content}\n\n[태그]\n{tags}"
 
-        # HTML 내의 H1 제목을 생성된 AI 제목으로 대체
+        # HTML 내의 H1 제목을 최종 제목으로 대체
         html_content = re.sub(r'<h1>.*?</h1>', f'<h1>📰 {title}</h1>', html_content, count=1, flags=re.IGNORECASE)
 
         # 해시태그 HTML 생성 및 본문 하단에 삽입
-        tag_list = tags.split()
-        tag_html = " ".join(f"<span style='display:inline-block; background:#1A1A1A; color:#FFCC00; padding:3px 8px; margin:3px 4px 3px 0; font-size:12px; border-radius:3px;'>{t}</span>" for t in tag_list)
-        tags_box = f"""
+        if tags:
+            tag_list = tags.split()
+            tag_html = " ".join(f"<span style='display:inline-block; background:#1A1A1A; color:#FFCC00; padding:3px 8px; margin:3px 4px 3px 0; font-size:12px; border-radius:3px;'>{t}</span>" for t in tag_list)
+            tags_box = f"""
 <div style="background:#fff; border:3px solid #1A1A1A; padding:14px 18px; margin-top:24px; margin-bottom:20px;">
   <h3 style="font-size:16px; font-weight:bold; margin-top:0; margin-bottom:10px;"># 태그</h3>
   {tag_html}
 </div>
 """
-        if "</body>" in html_content:
-            html_content = html_content.replace("</body>", f"{tags_box}\n</body>")
-        else:
-            html_content += tags_box
+            if "</body>" in html_content:
+                html_content = html_content.replace("</body>", f"{tags_box}\n</body>")
+            else:
+                html_content += tags_box
 
         # 이미지 상대 경로 → 절대 경로 치환 (발행용 HTML에만 적용)
         base_dir = os.path.dirname(file_path)
