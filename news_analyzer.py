@@ -4,9 +4,7 @@ news_analyzer.py — 뉴스 기사 분석 UI 섹션
 구글 뉴스 RSS 기사 선택 → Gemini 단계별 분석 → Desktop/lists/ 저장
 """
 import re
-import json
 import html
-import threading
 import traceback
 import webbrowser
 import urllib.request
@@ -17,13 +15,9 @@ from email.utils import parsedate_to_datetime
 
 import tkinter as tk
 from tkinter import ttk, messagebox
-from google import genai
-from google.genai import types
 
-try:
-    from standalone_poster import load_config
-except ImportError:
-    pass  # 오류는 gui_app.py 에서 처리
+from config_manager import load_config
+import gemini_service
 
 KST = timezone(timedelta(hours=9))
 
@@ -88,8 +82,9 @@ class NewsAnalyzerSection:
     build(container) 를 호출하면 container 안에 UI 전체를 구성한다.
     """
 
-    def __init__(self, root: tk.Tk, theme: dict):
+    def __init__(self, root: tk.Tk, theme: dict, thread_manager=None):
         self.root       = root
+        self.thread_manager = thread_manager
         self.bg_card      = theme["bg_card"]
         self.bg_input     = theme["bg_input"]
         self.text_light   = theme["text_light"]
@@ -104,6 +99,7 @@ class NewsAnalyzerSection:
         self.primary      = theme.get("primary",      "#1A1A1A")
         self.border_color = theme.get("border_color", "#1A1A1A")
         self.article_vars: list = []
+        self._on_blog_ready_cb = None   # gui_app.py 에서 등록: fn(html_path)
 
     # ──────────────────────────────────────────────
     # UI 구성
@@ -359,6 +355,20 @@ class NewsAnalyzerSection:
         )
         self.open_btn.pack(side="left", padx=(6, 0))
         self._bind_hover(self.open_btn, self.primary, self.accent)
+
+        self.blog_btn = tk.Button(
+            btn_row,
+            text="📤 발행",
+            font=("맑은 고딕", 10, "bold"),
+            bg="#2A7A2A", fg=self.text_light,
+            activebackground="#1E5C1E", activeforeground=self.text_light,
+            bd=0, relief="flat", cursor="hand2", padx=14, pady=12,
+            state="disabled",
+            command=self._send_to_blog,
+        )
+        self.blog_btn.pack(side="left", padx=(6, 0))
+        self._bind_hover(self.blog_btn, "#2A7A2A", "#1E5C1E")
+
         self.last_saved_path: str = ""
 
     # ──────────────────────────────────────────────
@@ -409,15 +419,19 @@ class NewsAnalyzerSection:
         self.load_btn.configure(state="disabled", text="불러오는 중... ⏳")
         self.article_count_lbl.configure(text="기사를 불러오는 중입니다...")
 
-        def fetch():
-            try:
-                articles = self._parse_rss_feed(url)
-                self.root.after(0, lambda: self._populate_article_list(articles))
-            except Exception as e:
-                msg = str(e)
-                self.root.after(0, lambda: self._on_rss_load_error(msg))
+        def run():
+            return self._parse_rss_feed(url)
 
-        threading.Thread(target=fetch, daemon=True).start()
+        def success(articles):
+            self._populate_article_list(articles)
+
+        def failure(e):
+            self._on_rss_load_error(str(e))
+
+        if self.thread_manager:
+            self.thread_manager.run_async(run, on_success=success, on_failure=failure)
+        else:
+            threading.Thread(target=lambda: success(run()), daemon=True).start()
 
     def _parse_rss_feed(self, url: str) -> list:
         req = urllib.request.Request(
@@ -569,23 +583,45 @@ class NewsAnalyzerSection:
             return
 
         self.analyze_btn.configure(state="disabled", text="분석 중... ⏳", bg="#4A4A4A")
-        threading.Thread(target=self._run_analysis, args=(cfg, selected), daemon=True).start()
 
-    def _run_analysis(self, cfg: dict, articles: list) -> None:
+        def run():
+            self._run_analysis_data(cfg, selected)
+
+        def success(result):
+            self.root.after(0, lambda: self._reset_btn(
+                self.analyze_btn, "📊  선택된 기사 분석하여 파일 저장", self.btn_rss
+            ))
+
+        def failure(e):
+            self.root.after(0, lambda: self._reset_btn(
+                self.analyze_btn, "📊  선택된 기사 분석하여 파일 저장", self.btn_rss
+            ))
+
+        if self.thread_manager:
+            self.thread_manager.run_async(run, on_success=success, on_failure=failure)
+        else:
+            def raw_worker():
+                try:
+                    run()
+                    self.root.after(0, success, None)
+                except Exception as e:
+                    self.root.after(0, failure, e)
+            threading.Thread(target=raw_worker, daemon=True).start()
+
+    def _run_analysis_data(self, cfg: dict, articles: list) -> None:
         try:
             print("\n" + "=" * 60)
             print(f"📰 선택된 기사 {len(articles)}개 분석을 시작합니다...")
 
             now          = datetime.now(KST)
             now_display  = now.strftime("%Y-%m-%d %H:%M")   # 문서 내용용
-            now_filename = now.strftime("%Y-%m-%d %H-%M")   # 파일명용 (07-03 형식)
+            now_filename = now.strftime("%Y-%m-%d %H-%M")   # 파일명용
             art_text     = self._build_articles_text(articles)
             model_id     = cfg.get("gemini_model", "gemini-3.1-flash-lite")
-            client       = genai.Client(api_key=cfg["gemini_api_key"])
 
             # 1단계: 제목 · 소제목 · 태그
             print(f"[1단계] 제목 · 소제목 목록 · 태그 생성 중... (모델: {model_id})")
-            outline    = self._gen_outline(client, art_text, len(articles), model_id)
+            outline    = gemini_service.generate_news_outline(cfg["gemini_api_key"], art_text, len(articles), model_id)
             title      = outline.get("title", "뉴스 분석 포스팅")
             sub_titles = outline.get("subheadings", [])
             tags       = outline.get("tags", [])
@@ -601,7 +637,7 @@ class NewsAnalyzerSection:
                     text=f"일괄 분석 중... ({n}개) ⏳"
                 ),
             )
-            all_analyses = self._gen_all_analyses(client, art_text, sub_titles, model_id)
+            all_analyses = gemini_service.generate_news_analyses(cfg["gemini_api_key"], art_text, sub_titles, model_id)
             print(f"   ✅ {total}개 분석 완료 (총 API 호출: 2회)")
 
             # 3단계: HTML 문서 작성 후 저장
@@ -618,6 +654,7 @@ class NewsAnalyzerSection:
             fp_str = str(file_path)
             self.last_saved_path = fp_str
             self.root.after(0, lambda: self.open_btn.configure(state="normal"))
+            self.root.after(0, lambda: self.blog_btn.configure(state="normal"))
             print(f"💾 저장 완료: {fp_str}\n" + "=" * 60)
 
             self.root.after(
@@ -625,7 +662,7 @@ class NewsAnalyzerSection:
                 lambda: messagebox.showinfo(
                     "분석 & 저장 완료",
                     f"분석 포스팅이 저장되었습니다!\n\n📁 저장 위치:\n{fp_str}\n\n"
-                    "[🌐 열어보기] 버튼으로 브라우저에서 바로 열 수 있습니다.",
+                    "[🌐 열어보기] 브라우저 미리보기  |  [📤 발행] 블로그 발행",
                 ),
             )
 
@@ -635,14 +672,6 @@ class NewsAnalyzerSection:
             self.root.after(
                 0,
                 lambda: messagebox.showerror("분석 실패", f"분석 도중 오류가 발생했습니다:\n\n{err}"),
-            )
-
-        finally:
-            self.root.after(
-                0,
-                lambda: self._reset_btn(
-                    self.analyze_btn, "📊 선택된 기사 분석하여 파일 저장", self.btn_rss
-                ),
             )
 
     # ──────────────────────────────────────────────
@@ -662,13 +691,18 @@ class NewsAnalyzerSection:
                 if p_clean.startswith('#'):
                     p_clean = re.sub(r'^#+\s*', '', p_clean)
                     p_clean = re.sub(r'[#\*\_]+', '', p_clean).strip()
-                    paras += f"<h3>{html.escape(p_clean)}</h3>"
+                    paras += f"<h3><b>{html.escape(p_clean)}</b></h3>"
                 else:
                     p_html = html.escape(p_clean)
                     p_html = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', p_html)
                     p_html = re.sub(r'\*(.*?)\*', r'<i>\1</i>', p_html)
+                    
+                    # 수치(+/-) 색상화 및 볼드 처리
+                    p_html = re.sub(r'(\+(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?(?:%|p|포인트|원|달러|배|억원|%p)?)', r'<b style="color: #E63B2E;">\1</b>', p_html)
+                    p_html = re.sub(r'(\-(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?(?:%|p|포인트|원|달러|배|억원|%p)?)', r'<b style="color: #0055FF;">\1</b>', p_html)
+                    
                     paras += f"<p>{p_html}</p>"
-            sections += f"<h2>{esc(clean_sub)}</h2>\n{paras}\n"
+            sections += f"<h2><b>{esc(clean_sub)}</b></h2>\n{paras}\n"
 
         sources = "".join(
             f"<li>{esc(a['title'])} "
@@ -699,19 +733,19 @@ class NewsAnalyzerSection:
 </style></head><body>
 <h1>📰 {esc(title)}</h1>
 <p class="meta">작성 일시: {esc(now_display)} (KST) · 분석 기사 {len(articles)}건</p>
-
+ 
 {sections}
-
+ 
 <div class="box">
 <h3>📎 출처 기사</h3>
 <ul>{sources}</ul>
 </div>
-
+ 
 <div class="box">
 <h3># 태그</h3>
 {tag_html}
 </div>
-
+ 
 <p class="meta" style="margin-top:28px;">
 ※ 구글 뉴스 RSS 기사를 Gemini AI로 분석해 작성한 문서입니다.</p>
 </body></html>"""
@@ -722,6 +756,16 @@ class NewsAnalyzerSection:
             webbrowser.open(Path(self.last_saved_path).as_uri())
         else:
             messagebox.showinfo("열어보기", "먼저 기사를 분석하여 파일을 저장해 주세요.")
+
+    def _send_to_blog(self) -> None:
+        """마지막 분석 HTML을 블로그 발행 탭으로 자동 전달한다."""
+        if not self.last_saved_path or not Path(self.last_saved_path).exists():
+            messagebox.showinfo("발행", "먼저 기사를 분석하여 파일을 저장해 주세요.")
+            return
+        if callable(self._on_blog_ready_cb):
+            self._on_blog_ready_cb(self.last_saved_path)
+        else:
+            messagebox.showinfo("발행", "블로그 발행 연동이 설정되지 않았습니다.")
 
     # ──────────────────────────────────────────────
     # 유틸
@@ -735,118 +779,3 @@ class NewsAnalyzerSection:
             if art.get("pubDate"):
                 parts.append(f"날짜: {art['pubDate'][:30]}\n")
         return "".join(parts)
-
-    def _clean_json(self, raw: str) -> str:
-        return re.sub(
-            r"^```(?:json)?\s*|\s*```\s*$", "", raw.strip(), flags=re.IGNORECASE
-        ).strip()
-
-    # ──────────────────────────────────────────────
-    # Gemini 호출
-    # ──────────────────────────────────────────────
-    def _gen_outline(self, client, art_text: str, n_articles: int, model_id: str = "gemini-3.1-flash-lite") -> dict:
-        sys_inst = f"""
-당신은 뉴스 기사 분석 전문 에디터입니다.
-제공된 기사들을 바탕으로 아래 JSON 형식으로만 응답하세요.
-코드 블록 없이 순수 JSON만 출력하세요.
-
-{{
-  "title": "분석 포스트 제목 (흥미롭고 SEO 최적화)",
-  "subheadings": ["소제목1", "소제목2", ...],
-  "tags": ["태그1", ..., "태그12이상"]
-}}
-
-규칙:
-- subheadings: 기사 {n_articles}개에 맞게 정확히 {n_articles}개 문자열 (분석 내용 없이 소제목만)
-- tags: 핵심 키워드 12개 이상, 한국어 단어
-- title: 기사 주제 반영, SEO 최적화
-"""
-        resp = client.models.generate_content(
-            model=model_id,
-            contents=f"다음 기사들의 분석 포스팅 목차를 작성해 주세요:\n{art_text}",
-            config=types.GenerateContentConfig(
-                system_instruction=sys_inst,
-                response_mime_type="application/json",
-                temperature=0.7,
-            ),
-        )
-        try:
-            data = json.loads(self._clean_json(resp.text or ""))
-            subs = data.get("subheadings", [])
-            if subs and isinstance(subs[0], dict):
-                subs = [s.get("title", "") for s in subs]
-            data["subheadings"] = subs
-            return data
-        except Exception:
-            return {
-                "title": "뉴스 분석 포스팅",
-                "subheadings": [f"기사 {i} 분석" for i in range(1, n_articles + 1)],
-                "tags": [],
-            }
-
-    def _gen_all_analyses(
-        self,
-        client,
-        art_text: str,
-        sub_titles: list,
-        model_id: str = "gemini-3.1-flash-lite",
-    ) -> list:
-        """
-        모든 소제목 분석을 1번의 API 호출로 처리.
-        Returns: list of (title, analysis) tuples
-        """
-        n = len(sub_titles)
-        numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(sub_titles))
-
-        sys_inst = f"""
-당신은 뉴스 기사 분석 전문 에디터입니다.
-제공된 기사들과 소제목 목록을 바탕으로 각 소제목에 대한 심층 분석을 한 번에 작성하세요.
-코드 블록 없이 순수 JSON만 출력하세요.
-
-{{
-  "analyses": [
-    {{"title": "소제목", "analysis": "분석 내용"}},
-    ...
-  ]
-}}
-
-규칙:
-- analyses 배열은 반드시 {n}개 (입력 소제목 순서 동일)
-- 각 title은 입력된 소제목 그대로 사용
-- 각 analysis: 수치(%, 금액, 연도, 순위) 반드시 포함, 700자 내외
-- 객관적 사실 기반, 한국어
-"""
-        user_message = (
-            f"기사 목록:\n{art_text}\n\n"
-            f"소제목 목록 ({n}개):\n{numbered}\n\n"
-            "위 기사를 바탕으로 각 소제목에 대한 분석을 작성해 주세요."
-        )
-
-        resp = client.models.generate_content(
-            model=model_id,
-            contents=user_message,
-            config=types.GenerateContentConfig(
-                system_instruction=sys_inst,
-                response_mime_type="application/json",
-                temperature=0.7,
-            ),
-        )
-
-        try:
-            data = json.loads(self._clean_json(resp.text or ""))
-            raw_list = data.get("analyses", [])
-        except Exception as e:
-            print(f"[경고] 일괄 분석 JSON 파싱 실패: {e}")
-            raw_list = []
-
-        # 결과를 소제목 순서에 맞게 정렬 (누락 분 보완)
-        result = []
-        for i, sub_title in enumerate(sub_titles):
-            if i < len(raw_list):
-                item = raw_list[i]
-                analysis = item.get("analysis", "(분석 내용 없음)")
-            else:
-                analysis = "(분석 누락)"
-            result.append((sub_title, analysis))
-
-        return result

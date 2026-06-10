@@ -43,14 +43,14 @@ VAR_REGISTRY = {
             _na("kospi_mid",    "중형주"),
             _na("kospi_small",  "소형주"),
         ]},
-        {"cat": "investors", "title": "② 투자자별 수급 (순매수/순매도)", "vars": [
+        {"cat": "investors", "title": "투자자별 수급 (순매수/순매도)", "vars": [
             _na("foreign",     "외국인"),
             _na("institution", "기관"),
             _na("individual",  "개인"),
             _na("pension",     "연기금"),
             _na("program",     "프로그램 매매(차익/비차익)"),
         ]},
-        {"cat": "internals", "title": "③ 시장 내부 변수", "vars": [
+        {"cat": "internals", "title": "시장 내부 변수", "vars": [
             _na("trade_value",    "거래대금"),
             _na("trade_volume",   "거래량"),
             _na("credit_balance", "신용잔고"),
@@ -59,18 +59,18 @@ VAR_REGISTRY = {
             _na("updown",         "상승/하락 종목 수"),
             _na("vkospi",         "VKOSPI(변동성지수)"),
         ]},
-        {"cat": "rates", "title": "④ 금리 / 채권", "vars": [
+        {"cat": "rates", "title": "금리 / 채권", "vars": [
             _na("ktb3",        "국고채 3년"),
             _na("ktb10",       "국고채 10년"),
             _na("cd",          "CD금리"),
             _na("corp_spread", "회사채 스프레드(AA-)"),
         ]},
-        {"cat": "fx", "title": "⑤ 환율", "vars": [
+        {"cat": "fx", "title": "② 환율", "vars": [
             _v("usdkrw", "USD/KRW(원/달러)", "yf",      "KRW=X"),
             _v("jpykrw", "JPY/KRW(엔/원)",   "yf",      "JPYKRW=X"),
             _v("cnykrw", "CNY/KRW(위안/원)", "derived", "cnykrw"),
         ]},
-        {"cat": "overseas", "title": "⑥ 해외 참조 변수 (한국장에 직접 영향)", "vars": [
+        {"cat": "overseas", "title": "③ 해외 참조 변수 (한국장에 직접 영향)", "vars": [
             _v("us3_prev", "미국 3대 지수 전일 마감(다우·S&P500·나스닥)", "yf_multi",
                [("다우", "^DJI"), ("S&P500", "^GSPC"), ("나스닥", "^IXIC")]),
             _v("us_futures", "미국 지수 선물(실시간)", "yf_multi",
@@ -172,6 +172,45 @@ def _kst_to_et(dt_kst: datetime) -> datetime:
     return (dt_utc + offset).replace(tzinfo=None)
 
 
+def get_latest_trading_date(market_type: str) -> date:
+    """시장별 가장 최근 정규장 거래일 반환."""
+    now_kst = datetime.now(KST)
+    if market_type == "us":
+        et = _kst_to_et(now_kst)
+        w = et.weekday()
+        t = et.time()
+        # 주말 휴장
+        if w == 5: # 토요일 -> 금요일
+            return (et - timedelta(days=1)).date()
+        elif w == 6: # 일요일 -> 금요일
+            return (et - timedelta(days=2)).date()
+        # 평일
+        if t < dtime(9, 30):
+            # 장전 -> 이전 영업일
+            if w == 0: # 월요일 장전 -> 금요일
+                return (et - timedelta(days=3)).date()
+            else: # 화~금 장전 -> 어제
+                return (et - timedelta(days=1)).date()
+        else:
+            return et.date()
+    else: # "kr"
+        w = now_kst.weekday()
+        t = now_kst.time()
+        # 주말 휴장
+        if w == 5:
+            return (now_kst - timedelta(days=1)).date()
+        elif w == 6:
+            return (now_kst - timedelta(days=2)).date()
+        # 평일
+        if t < dtime(9, 0):
+            if w == 0:
+                return (now_kst - timedelta(days=3)).date()
+            else:
+                return (now_kst - timedelta(days=1)).date()
+        else:
+            return now_kst.date()
+
+
 def kr_status(now: datetime = None) -> tuple:
     """한국 시장 상태 → (라벨, 상세, 실시간여부)."""
     now = now or datetime.now(KST)
@@ -227,12 +266,14 @@ def _fetch_naver_index(code: str) -> dict:
             data = json.loads(resp.read().decode('utf-8'))
         last = float(data['closePrice'].replace(',', ''))
         diff = float(data['compareToPreviousClosePrice'].replace(',', ''))
-        pct = float(data['fluctuationsRatio'].replace(',', ''))
-        
-        sign_name = data.get('compareToPreviousPrice', {}).get('name', '')
-        if 'FALL' in sign_name or 'DOWN' in sign_name:
-            diff = -diff
-            pct = -pct
+        pct  = float(data['fluctuationsRatio'].replace(',', ''))
+
+        # name 필드는 'FALLING'/'RISING'(영문) 또는 '하락'/'상승'(한글) 두 형태 모두 가능.
+        # API가 이미 부호를 포함해 반환하지만, abs()로 정규화 후 name 기준으로 부호를 확정한다.
+        sign_name = (data.get('compareToPreviousPrice', {}) or {}).get('name', '')
+        is_falling = 'FALL' in sign_name or 'DOWN' in sign_name or '하락' in sign_name or '하한가' in sign_name
+        diff = -abs(diff) if is_falling else abs(diff)
+        pct  = -abs(pct)  if is_falling else abs(pct)
             
         asof = data.get('localTradedAt', '')[:10]
         return {"last": last, "prev": last - diff, "diff": diff, "pct": pct, "asof": asof}
@@ -314,29 +355,57 @@ def fetch_yf_batch(symbols: list) -> dict:
 
         try:
             h = yf.Ticker(sym).history(period="5d", interval="1d", auto_adjust=False)
+            
+            # fast_info 정보 수집 (장 상태 무관하게 항상 가져오기 시도)
+            fast_price = None
+            fast_prev = None
+            try:
+                tk = yf.Ticker(sym)
+                fast = tk.fast_info
+                if fast:
+                    if getattr(fast, "last_price", None) is not None:
+                        fast_price = float(fast.last_price)
+                    if getattr(fast, "previous_close", None) is not None:
+                        fast_prev = float(fast.previous_close)
+            except Exception as fe:
+                print(f"  [경고] {sym} fast_info 조회 실패: {fe}")
+
+            import pandas as pd
+            if h is not None and "Close" in h and not h.empty:
+                last_idx = h.index[-1]
+                if pd.isna(h["Close"].iloc[-1]) and fast_price is not None:
+                    h.loc[last_idx, "Close"] = fast_price
+
             if h is not None and "Close" in h:
-                quote = _quote_from_close(h["Close"].dropna())
-                if quote and is_symbol_market_active(sym):
-                    try:
-                        tk = yf.Ticker(sym)
-                        fast = tk.fast_info
-                        if fast and getattr(fast, "last_price", None) is not None:
-                            live_price = float(fast.last_price)
-                            prev_close = float(getattr(fast, "previous_close", quote["prev"]))
-                            quote["last"] = live_price
-                            quote["prev"] = prev_close
-                            quote["diff"] = live_price - prev_close
-                            quote["pct"] = (live_price - prev_close) / prev_close * 100 if prev_close else 0.0
-                            
-                            now_kst = datetime.now(KST)
-                            if any(us_key in sym for us_key in ["^DJI", "^GSPC", "^IXIC", "^NDX", "^RUT", "^SOX", "^VIX", "^TNX", "^TYX"]):
-                                et_now = _kst_to_et(now_kst)
-                                quote["asof"] = et_now.strftime("%Y-%m-%d %H:%M") + " (ET)"
-                            else:
-                                quote["asof"] = now_kst.strftime("%Y-%m-%d %H:%M") + " (KST)"
-                    except Exception as fe:
-                        print(f"  [경고] {sym} 실시간(fast_info) 갱신 실패: {fe}")
-                return sym, quote
+                close_series = h["Close"].dropna()
+                quote = _quote_from_close(close_series)
+            else:
+                quote = None
+
+            if quote and fast_price is not None:
+                live_price = fast_price
+                prev_close = fast_prev if fast_prev is not None else quote["prev"]
+                quote["last"] = live_price
+                quote["prev"] = prev_close
+                quote["diff"] = live_price - prev_close
+                quote["pct"] = (live_price - prev_close) / prev_close * 100 if prev_close else 0.0
+
+                now_kst = datetime.now(KST)
+                if any(us_key in sym for us_key in ["^DJI", "^GSPC", "^IXIC", "^NDX", "^RUT", "^SOX", "^VIX", "^TNX", "^TYX"]):
+                    if is_symbol_market_active(sym):
+                        et_now = _kst_to_et(now_kst)
+                        quote["asof"] = et_now.strftime("%Y-%m-%d %H:%M") + " (ET)"
+                    else:
+                        ld = get_latest_trading_date("us")
+                        quote["asof"] = f"{ld} 16:00 (ET)"
+                else:
+                    if is_symbol_market_active(sym):
+                        quote["asof"] = now_kst.strftime("%Y-%m-%d %H:%M") + " (KST)"
+                    else:
+                        ld = get_latest_trading_date("kr")
+                        quote["asof"] = f"{ld} 15:30 (KST)"
+
+            return sym, quote
         except Exception as e:
             print(f"  [경고] {sym} 수집 실패: {e}")
         return sym, None

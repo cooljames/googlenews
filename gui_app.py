@@ -13,13 +13,9 @@ import re
 
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
-from google import genai
-from google.genai import types
 
 try:
     from standalone_poster import (
-        load_config,
-        save_config,
         get_driver,
         ensure_logged_in,
         write_post,
@@ -33,6 +29,10 @@ except ImportError:
     sys.exit(1)
 
 from news_analyzer import NewsAnalyzerSection
+from config_manager import load_config, save_config
+from thread_manager import ThreadManager
+import gemini_service
+import utils
 
 try:
     from stock_report import StockReportSection
@@ -111,6 +111,7 @@ class NaverPosterGUI:
         self.setup_styles()
 
         self.log_queue = queue.Queue()
+        self.thread_manager = ThreadManager(self.root)
 
         self.create_widgets()
         self.load_and_populate_config()
@@ -287,9 +288,6 @@ class NaverPosterGUI:
             self.console_expanded = True
 
     # ──────────────────────────────────────────────
-    # 글쓰기 탭
-    # ──────────────────────────────────────────────
-    # ──────────────────────────────────────────────
     # 블로그 발행 탭
     # ──────────────────────────────────────────────
     def build_blog_tab(self) -> None:
@@ -353,7 +351,7 @@ class NaverPosterGUI:
         
         tk.Label(
             html_frame,
-            text="주식 리포트 또는 뉴스 분석에서\n발행된 HTML 파일을 직접 불러와\n블로그 포스팅으로 전송합니다.",
+            text="주식 리포트 탭 [📤 발행] 버튼으로\n자동 전달, 또는 파일을 직접 선택.",
             font=("맑은 고딕", 8),
             bg=self.bg_card, fg=self.text_muted, justify="left",
         ).pack(fill="x", pady=(0, 6))
@@ -375,21 +373,30 @@ class NaverPosterGUI:
         # Right Panel (Editor & Publisher)
         right_panel = tk.LabelFrame(
             container,
-            text="  📝 발행 대기 콘텐츠 (편집 가능)  ",
+            text="  📝 발행 대기 콘텐츠  ",
             font=("맑은 고딕", 9, "bold"),
             bg=self.bg_card, fg=self.text_dark,
             bd=3, relief="solid",
             padx=10, pady=8,
         )
         right_panel.pack(side="right", fill="both", expand=True)
-        
+
+        # HTML 리포트 로드 시 안내 레이블
+        self.html_notice_lbl = tk.Label(
+            right_panel,
+            text="",
+            font=("맑은 고딕", 8), bg=self.bg_card, fg="#555555",
+            anchor="w", wraplength=480, justify="left",
+        )
+        self.html_notice_lbl.pack(fill="x", pady=(0, 4))
+
         # Title Field
         tk.Label(
             right_panel, text="제목:",
             font=("맑은 고딕", 9, "bold"),
             bg=self.bg_card, fg=self.text_dark,
         ).pack(anchor="w", pady=(0, 2))
-        
+
         self.blog_title_entry = tk.Entry(
             right_panel,
             bg=self.bg_input, fg=self.text_dark,
@@ -399,14 +406,14 @@ class NaverPosterGUI:
         )
         self.blog_title_entry.pack(fill="x", pady=(0, 8))
         self.blog_title_entry.insert(0, "[초안 제목이 이곳에 표시됩니다]")
-        
+
         # Content Field
         tk.Label(
-            right_panel, text="본문 내용:",
+            right_panel, text="본문 내용 (미리보기 — 실제 발행 시 표·이미지 포함 HTML 원본이 전송됩니다):",
             font=("맑은 고딕", 9, "bold"),
             bg=self.bg_card, fg=self.text_dark,
         ).pack(anchor="w", pady=(0, 2))
-        
+
         self.blog_content_text = scrolledtext.ScrolledText(
             right_panel,
             bg=self.bg_input, fg=self.text_dark,
@@ -417,7 +424,7 @@ class NaverPosterGUI:
         self.blog_content_text.pack(fill="both", expand=True, pady=(0, 8))
         self.blog_content_text.insert(
             "1.0",
-            "[초안 본문이 이곳에 표시됩니다. 자유롭게 추가 및 수정할 수 있습니다.]",
+            "[초안 본문이 이곳에 표시됩니다.]",
         )
         
         # Hashtags Field
@@ -460,8 +467,10 @@ class NaverPosterGUI:
         container.pack(fill="both", expand=True, padx=8, pady=6)
 
         # ── 뉴스 기사 분석 (news_analyzer.py) ──
-        self.news_section = NewsAnalyzerSection(self.root, self._theme_dict())
+        self.news_section = NewsAnalyzerSection(self.root, self._theme_dict(), self.thread_manager)
         self.news_section.build(container)
+        # 분석 완료 시 블로그 탭으로 자동 전달 콜백 등록
+        self.news_section._on_blog_ready_cb = self._load_report_to_blog
 
     # ──────────────────────────────────────────────
     # 테마 딕셔너리 (섹션 모듈에 전달)
@@ -502,6 +511,8 @@ class NaverPosterGUI:
 
         self.stock_section = StockReportSection(self.root, self._theme_dict())
         self.stock_section.build(container)
+        # 리포트 완료 시 블로그 탭으로 자동 전달 콜백 등록
+        self.stock_section._on_blog_ready_cb = self._load_report_to_blog
 
     # ──────────────────────────────────────────────
     # 종목 탐색 탭
@@ -661,54 +672,29 @@ class NaverPosterGUI:
             messagebox.showwarning("설정 오류", "네이버 ID/PW가 설정되지 않았습니다. 설정 탭에서 입력해 주세요.")
             return
 
-        # HTML 파일 형식인지 판별 및 분기 처리
-        is_html = False
-        full_content = ""
-
+        # HTML 리포트 로드 여부에 따라 발행 방식 결정
         loaded_html = getattr(self, "loaded_html_content", "")
         if loaded_html:
-            # 공백 및 줄바꿈을 정규화하여 순수 문자열 비교
-            normalized_editor = re.sub(r"\s+", "", content)
-            normalized_plain = re.sub(r"\s+", "", getattr(self, "loaded_plain_content", ""))
-            
-            if normalized_editor == normalized_plain:
-                # 편집 없음 -> 원본 HTML 발행
-                is_html = True
-                full_content = loaded_html
-            else:
-                # 편집 감지 -> 예/아니오/취소 선택 대화상자
-                ans = messagebox.askyesnocancel(
-                    "편집 감지",
-                    "에디터 창에서 수정된 내용이 감지되었습니다.\n\n"
-                    "[예] 수정된 텍스트만 발행 (표/이미지 제외)\n"
-                    "[아니오] 원본 HTML 그대로 발행 (표/이미지 유지, 수정 사항 무시)\n"
-                    "[취소] 포스팅 중단"
-                )
-                if ans is True:  # 수정된 텍스트 발행
-                    is_html = False
-                    full_content = content
-                elif ans is False:  # 원본 HTML 발행
-                    is_html = True
-                    full_content = loaded_html
-                else:  # 취소
-                    return
+            # HTML 리포트 모드: 항상 원본 HTML(표·이미지 포함) 발행
+            is_html = True
+            full_content = loaded_html
         else:
-            # HTML 파일 로드가 아닌 일반 모드 (초안 생성 등)
+            # AI 초안 모드: 에디터 텍스트 그대로 발행
             is_html = bool(re.search(r'<(?:html|body|div|table|p|h[1-6]|ul|ol|br\s*/?)[\s>]', content, re.IGNORECASE))
             full_content = content
         
         if is_html:
             # HTML 내 로컬 이미지 절대 경로를 base64 데이터로 치환
             print("[클립보드] HTML 이미지 base64 변환을 시작합니다...")
-            full_content = self.resolve_html_images_to_base64(full_content)
+            full_content = utils.resolve_html_images_to_base64(full_content)
             print("✅ HTML 이미지 변환 완료")
 
         self._reset_button(self.post_btn, "작업 진행 중... ⏳", self.gray)
         self.post_btn.configure(state="disabled")
 
-        threading.Thread(
-            target=self.run_posting, args=(cfg, title, full_content, tags), daemon=True
-        ).start()
+        self.thread_manager.run_async(
+            self.run_posting, cfg, title, full_content, tags
+        )
 
     def run_posting(self, cfg: dict, title: str, content: str, tags: str = "") -> None:
         driver = None
@@ -768,273 +754,167 @@ class NaverPosterGUI:
         self.ai_gen_btn.configure(state="disabled", text="생성 중... ⏳", bg=self.gray)
         
         def run():
-            try:
-                self.loaded_html_content = ""
-                self.loaded_plain_content = ""
-                print("\n" + "=" * 60)
-                print("[AI 생성] Gemini API로 블로그 콘텐츠 생성을 요청합니다...")
-                model_id = cfg.get("gemini_model", DEFAULT_MODEL)
-                title, content = self.generate_blog_content(cfg["gemini_api_key"], prompt_val, model_id)
-                print(f"✅ AI 콘텐츠 초안 생성 완료! 제목: {title}")
-                
-                # 해시태그 생성 (12~15개)
-                print("[AI 태그] 본문 기반 해시태그 12~15개 선정을 시작합니다...")
-                tags = self.generate_hashtags(cfg["gemini_api_key"], model_id, content)
-                print(f"✅ 해시태그 생성 완료: {tags}")
-                
-                def update_gui():
-                    self.blog_title_entry.delete(0, "end")
-                    self.blog_title_entry.insert(0, title)
-                    self.blog_content_text.delete("1.0", "end")
-                    self.blog_content_text.insert("1.0", content)
-                    self.blog_tags_entry.delete(0, "end")
-                    self.blog_tags_entry.insert(0, tags)
-                    print("[시스템] 에디터 창에 생성된 내용을 로드했습니다.")
-                    
-                self.root.after(0, update_gui)
-            except Exception as e:
-                print(f"❌ AI 생성 실패: {e}")
-                self.root.after(0, lambda: messagebox.showerror("AI 생성 실패", f"에러가 발생했습니다:\n{e}"))
-            finally:
-                self.root.after(0, lambda: self.ai_gen_btn.configure(state="normal", text="🤖 AI 초안 생성", bg=self.btn_rss))
-
-        threading.Thread(target=run, daemon=True).start()
-
-    def parse_html_report(self, html_content: str) -> tuple:
-        """HTML 보고서에서 제목과 본문 텍스트를 파싱하여 추출."""
-        import html as py_html
-        
-        # 1. 제목 추출 (title 태그 우선, 없을 시 h1 태그)
-        title = "주식/ETF 뉴스 리포트"
-        title_match = re.search(r"<title>(.*?)</title>", html_content, re.IGNORECASE)
-        if title_match:
-            title = py_html.unescape(title_match.group(1).strip())
-        else:
-            h1_match = re.search(r"<h1>(.*?)</h1>", html_content, re.IGNORECASE)
-            if h1_match:
-                title = py_html.unescape(re.sub(r"<[^>]+>", "", h1_match.group(1)).strip())
-
-        # 2. 본문 추출
-        # HTML 주석 제거
-        body_content = re.sub(r"<!--.*?-->", "", html_content, flags=re.DOTALL)
-        
-        # style 태그 제거
-        body_content = re.sub(r"<style[^>]*>.*?</style>", "", body_content, flags=re.DOTALL | re.IGNORECASE)
-        # head 태그 제거
-        body_content = re.sub(r"<head[^>]*>.*?</head>", "", body_content, flags=re.DOTALL | re.IGNORECASE)
-        # script 태그 제거
-        body_content = re.sub(r"<script[^>]*>.*?</script>", "", body_content, flags=re.DOTALL | re.IGNORECASE)
-
-        # 테이블 셀 구분 보존: th, td 태그 앞에 공백/구분선 추가
-        body_content = re.sub(r"<th[^>]*>", " | ", body_content, flags=re.IGNORECASE)
-        body_content = re.sub(r"<td[^>]*>", " | ", body_content, flags=re.IGNORECASE)
-
-        # 주요 블록 태그들을 줄바꿈으로 치환하여 단락 보존
-        body_content = re.sub(r"<(p|tr|h1|h2|h3|div|li)[^>]*>", "\n", body_content, flags=re.IGNORECASE)
-        body_content = re.sub(r"<br[^>]*>", "\n", body_content, flags=re.IGNORECASE)
-        
-        # 나머지 모든 HTML 태그 제거
-        body_content = re.sub(r"<[^>]+>", "", body_content)
-        
-        # HTML 엔티티 디코딩
-        body_content = py_html.unescape(body_content)
-        
-        # 줄바꿈 정제 및 불필요한 연속 공백 정돈
-        lines = []
-        for line in body_content.split("\n"):
-            line_str = line.strip()
-            # 양끝 구분선 정리
-            if line_str.startswith("|"):
-                line_str = line_str[1:].strip()
-            if line_str.endswith("|"):
-                line_str = line_str[:-1].strip()
+            self.loaded_html_content = ""
+            self.loaded_plain_content = ""
+            print("\n" + "=" * 60)
+            print("[AI 생성] Gemini API로 블로그 콘텐츠 생성을 요청합니다...")
+            model_id = cfg.get("gemini_model", DEFAULT_MODEL)
+            title, content = gemini_service.generate_blog_content(cfg["gemini_api_key"], prompt_val, model_id)
+            print(f"✅ AI 콘텐츠 초안 생성 완료! 제목: {title}")
             
-            # 다중 공백 제거
-            line_str = re.sub(r"\s+", " ", line_str).strip()
-            
-            if line_str:
-                lines.append(line_str)
-                
-        content_text = "\n\n".join(lines)
-        return title, content_text
+            # 해시태그 생성 (12~15개)
+            print("[AI 태그] 본문 기반 해시태그 12~15개 선정을 시작합니다...")
+            tags = gemini_service.generate_hashtags(cfg["gemini_api_key"], model_id, content)
+            print(f"✅ 해시태그 생성 완료: {tags}")
+            return title, content, tags
 
-    def generate_hashtags(self, api_key: str, model_id: str, content_text: str) -> str:
-        """본문 내용에서 12~15개 문장의 핵심 단어를 포착하여 해시태그 생성."""
-        client = genai.Client(api_key=api_key)
-        system_instruction = """
-        당신은 블로그 마케팅 전문가입니다.
-        제공된 본문 텍스트에서 가장 중요한 문장 12~15개에 상응하는, 각 문장의 핵심 의미나 단어를 포착하여 12개 이상 15개 이하의 해시태그를 한국어로 생성하십시오.
-        
-        규칙:
-        - 반드시 해시태그 개수는 12개에서 15개 사이여야 합니다.
-        - 각 해시태그는 '#'로 시작해야 하며, 띄어쓰기 없이 단어나 짧은 어구로 구성하십시오. (예: #코스피상승, #반도체전망)
-        - 해시태그 간에는 공백으로 구분하십시오.
-        - 다른 설명이나 멘트 없이 오직 해시태그 목록만 반환하십시오.
-        """
-        try:
-            response = client.models.generate_content(
-                model=model_id,
-                contents=content_text[:8000],  # 입력 제한 방지
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    temperature=0.5,
-                ),
-            )
-            tags = (response.text or "").strip()
-            found_tags = re.findall(r"#[^\s#]+", tags)
-            if 12 <= len(found_tags) <= 15:
-                return " ".join(found_tags)
-            
-            # 개수 부족 또는 초과 시 재보정
-            if len(found_tags) < 12:
-                default_tags = ["#주식시황", "#금융뉴스", "#증시분석", "#거시경제", "#투자정보", "#시장분석", "#테크뉴스", "#시장동향", "#블로그포스팅"]
-                for dt in default_tags:
-                    if dt not in found_tags:
-                        found_tags.append(dt)
-                        if len(found_tags) >= 12:
-                            break
-            return " ".join(found_tags[:15])
-        except Exception as e:
-            print(f"[경고] 해시태그 생성 중 오류: {e}")
-            return "#주식시황 #증시분석 #금융뉴스 #거시경제 #재테크 #시장전망 #투자정보 #주식투자 #주가분석 #테크트렌드 #AI기술 #IT뉴스"
+        def success(result):
+            title, content, tags = result
+            self.blog_title_entry.delete(0, "end")
+            self.blog_title_entry.insert(0, title)
+            self.blog_content_text.delete("1.0", "end")
+            self.blog_content_text.insert("1.0", content)
+            self.blog_tags_entry.delete(0, "end")
+            self.blog_tags_entry.insert(0, tags)
+            self.ai_gen_btn.configure(state="normal", text="🤖 AI 초안 생성", bg=self.btn_rss)
+            print("[시스템] 에디터 창에 생성된 내용을 로드했습니다.")
+
+        def failure(e):
+            self.ai_gen_btn.configure(state="normal", text="🤖 AI 초안 생성", bg=self.btn_rss)
+            print(f"❌ AI 생성 실패: {e}")
+            messagebox.showerror("AI 생성 실패", f"에러가 발생했습니다:\n{e}")
+
+        self.thread_manager.run_async(run, on_success=success, on_failure=failure)
 
     def open_html_file(self) -> None:
         from tkinter import filedialog
-        import os
         file_path = filedialog.askopenfilename(
             title="기존 발행된 HTML 파일 선택",
             filetypes=[("HTML Files", "*.html"), ("All Files", "*.*")]
         )
         if not file_path:
             return
-            
         cfg = load_config()
         if not cfg.get("gemini_api_key"):
             messagebox.showwarning("설정 오류", "해시태그 분석을 위해 Gemini API Key가 필요합니다. 설정 탭에서 입력해 주세요.")
             return
-
         self.import_btn.configure(state="disabled", text="불러오는 중... ⏳", bg=self.gray)
+        
+        def run():
+            self._do_load_html_data(file_path, cfg)
+
+        def success(result):
+            self.import_btn.configure(state="normal", text="📂 기존 HTML 파일 열기", bg=self.accent)
+
+        def failure(e):
+            self.import_btn.configure(state="normal", text="📂 기존 HTML 파일 열기", bg=self.accent)
+            messagebox.showerror("HTML 로드 실패", f"에러가 발생했습니다:\n{e}")
+
+        self.thread_manager.run_async(run, on_success=success, on_failure=failure)
+
+    def _load_report_to_blog(self, file_path: str) -> None:
+        """주식 리포트 탭 [📤 발행] 버튼에서 자동 호출. 블로그 탭으로 전환 후 HTML 로드."""
+        cfg = load_config()
+        if not cfg.get("gemini_api_key"):
+            messagebox.showwarning("설정 오류", "해시태그 분석을 위해 Gemini API Key가 필요합니다. 설정 탭에서 입력해 주세요.")
+            return
+        # 블로그 탭(인덱스 0)으로 전환
+        self.notebook.select(0)
+        self.import_btn.configure(state="disabled", text="리포트 불러오는 중... ⏳", bg=self.gray)
 
         def run():
-            try:
-                print("\n" + "=" * 60)
-                print(f"📂 HTML 파일 읽는 중: {file_path}")
-                with open(file_path, "r", encoding="utf-8") as f:
-                    html_content = f.read()
-                
-                title, plain_content = self.parse_html_report(html_content)
-                print(f"✅ HTML 분석 완료! 제목: {title} / 본문: 약 {len(plain_content)}자")
-                
-                # 해시태그 생성 (12~15개)
-                print("[AI 태그] 본문 문장에서 해시태그 12~15개 선정을 시작합니다...")
-                model_id = cfg.get("gemini_model", DEFAULT_MODEL)
-                tags = self.generate_hashtags(cfg["gemini_api_key"], model_id, plain_content)
-                print(f"✅ 해시태그 선정 완료: {tags}")
-                
-                # HTML 내의 이미지 상대 경로를 절대 경로로 치환하여 에디터에 로드
-                base_dir = os.path.dirname(file_path)
-                def make_abs_src(match):
-                    img_tag = match.group(0)
-                    src_match = re.search(r'src=["\'](.*?)["\']', img_tag, re.IGNORECASE)
-                    if not src_match:
-                        return img_tag
-                    src = src_match.group(1)
-                    if src.startswith("data:") or os.path.isabs(src):
-                        return img_tag
-                    abs_path = os.path.abspath(os.path.join(base_dir, src)).replace("\\", "/")
-                    return re.sub(r'src=["\'](.*?)["\']', lambda m: f'src="{abs_path}"', img_tag, flags=re.IGNORECASE)
-                
-                html_with_abs_images = re.sub(r'<img[^>]+>', make_abs_src, html_content, flags=re.IGNORECASE)
-                
-                # 상태 변수에 저장
-                self.loaded_html_content = html_with_abs_images
-                self.loaded_plain_content = html_with_abs_images  # HTML 원문으로 비교
+            self._do_load_html_data(file_path, cfg)
 
-                def update_gui():
-                    self.blog_title_entry.delete(0, "end")
-                    self.blog_title_entry.insert(0, title)
-                    self.blog_content_text.delete("1.0", "end")
-                    self.blog_content_text.insert("1.0", html_with_abs_images)  # HTML 원문 표시
-                    self.blog_tags_entry.delete(0, "end")
-                    self.blog_tags_entry.insert(0, tags)
-                    print("[시스템] 불러온 HTML 원문 및 태그 정보를 에디터 창에 로드했습니다.")
-                    
-                self.root.after(0, update_gui)
-            except Exception as e:
-                print(f"❌ HTML 로드 실패: {e}")
-                self.root.after(0, lambda: messagebox.showerror("HTML 로드 실패", f"에러가 발생했습니다:\n{e}"))
-            finally:
-                self.root.after(0, lambda: self.import_btn.configure(state="normal", text="📂 기존 HTML 파일 열기", bg=self.accent))
+        def success(result):
+            self.import_btn.configure(state="normal", text="📂 기존 HTML 파일 열기", bg=self.accent)
 
-        threading.Thread(target=run, daemon=True).start()
+        def failure(e):
+            self.import_btn.configure(state="normal", text="📂 기존 HTML 파일 열기", bg=self.accent)
+            messagebox.showerror("HTML 로드 실패", f"에러가 발생했습니다:\n{e}")
 
-    def resolve_html_images_to_base64(self, html_content: str) -> str:
-        """HTML 내의 로컬 이미지 절대 경로를 찾아 base64 데이터 URI로 변환."""
-        import base64
+        self.thread_manager.run_async(run, on_success=success, on_failure=failure)
+
+    def _do_load_html_data(self, file_path: str, cfg: dict) -> None:
+        """HTML 파일을 읽어 평문 미리보기를 에디터에, 원본 HTML을 내부에 보관한다."""
         import os
-        
-        def replace_img(match):
-            img_tag = match.group(0)
-            src_match = re.search(r'src=["\'](.*?)["\']', img_tag, re.IGNORECASE)
-            if not src_match:
-                return img_tag
-                
-            src = src_match.group(1)
-            if src.startswith("data:"):
-                return img_tag
-                
-            img_path = os.path.abspath(src)
-            if os.path.exists(img_path):
-                try:
-                    ext = os.path.splitext(img_path)[1].lower().replace(".", "")
-                    if ext == "jpg":
-                        ext = "jpeg"
-                    with open(img_path, "rb") as img_file:
-                        img_data = img_file.read()
-                    base64_data = base64.b64encode(img_data).decode("utf-8")
-                    new_src = f"data:image/{ext};base64,{base64_data}"
-                    return re.sub(r'src=["\'](.*?)["\']', lambda m: f'src="{new_src}"', img_tag, flags=re.IGNORECASE)
-                except Exception as e:
-                    print(f"[경고] 이미지 base64 변환 실패 ({img_path}): {e}")
-            else:
-                print(f"[경고] 이미지를 찾을 수 없음: {img_path}")
-            return img_tag
+        print("\n" + "=" * 60)
+        print(f"📂 HTML 파일 읽는 중: {file_path}")
+        with open(file_path, "r", encoding="utf-8") as f:
+            html_content = f.read()
 
-        return re.sub(r'<img[^>]+>', replace_img, html_content, flags=re.IGNORECASE)
-
-    def generate_blog_content(self, api_key: str, prompt_text: str, model_id: str = DEFAULT_MODEL):
-        client = genai.Client(api_key=api_key)
-        system_instruction = """
-당신은 네이버 블로그 포스팅을 전문으로 하는 지식이 풍부하고 유려한 에디터입니다.
-사용자가 제공하는 주제/프롬프트에 맞추어 전문적이면서도 친근한 어투로 한국어 글을 작성하세요.
-문단 구분을 확실하게 하여 가독성을 높여 주시기 바랍니다.
-
-반드시 아래 JSON 스키마 형식으로만 응답하며, 코드 블록 없이 순수 JSON만 출력하세요.
-
-{
-  "title": "블로그 포스트 제목",
-  "content": "풍부하고 상세한 본문 내용 (단락 구분은 \\n 활용)"
-}
-"""
-        response = client.models.generate_content(
-            model=model_id,
-            contents=prompt_text,
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                response_mime_type="application/json",
-                temperature=0.7,
-            ),
+        # 기존 태그 박스 제거 (중복 삽입 방지)
+        html_content = re.sub(
+            r'<div[^>]*>\s*<h3[^>]*>#\s*태그</h3>.*?</div>',
+            '',
+            html_content,
+            flags=re.DOTALL | re.IGNORECASE
         )
-        raw = self._clean_json(response.text or "")
-        try:
-            data = json.loads(raw)
-            return data.get("title", f"포스트: {prompt_text[:15]}..."), data.get("content", raw)
-        except Exception as json_err:
-            print(f"[경고] JSON 파싱 폴백: {json_err}")
-            lines = [line.strip() for line in raw.split("\n") if line.strip()]
-            if lines:
-                return lines[0].replace("#", "").replace('"', "").strip(), "\n\n".join(lines[1:])
-            return f"포스트: {prompt_text[:15]}...", raw
+
+        _, plain_content = utils.parse_html_report(html_content)
+        
+        # 제목 생성 (2026년 6월 10일 형식 + 핵심 어휘, 2/3 길이)
+        print("[AI 제목] 본문에서 블로그 제목 생성 시작...")
+        model_id = cfg.get("gemini_model", DEFAULT_MODEL)
+        title = gemini_service.generate_report_title(cfg["gemini_api_key"], model_id, plain_content)
+        print(f"✅ AI 제목 생성 완료! 제목: {title} / 본문: 약 {len(plain_content)}자")
+
+        # 해시태그 생성 (12~15개)
+        print("[AI 태그] 본문에서 해시태그 선정 시작...")
+        tags = gemini_service.generate_hashtags(cfg["gemini_api_key"], model_id, plain_content)
+        print(f"✅ 해시태그 선정 완료: {tags}")
+
+        # 평문 미리보기에도 해시태그 추가
+        plain_content_with_tags = f"{plain_content}\n\n[태그]\n{tags}"
+
+        # HTML 내의 H1 제목을 생성된 AI 제목으로 대체
+        html_content = re.sub(r'<h1>.*?</h1>', f'<h1>📰 {title}</h1>', html_content, count=1, flags=re.IGNORECASE)
+
+        # 해시태그 HTML 생성 및 본문 하단에 삽입
+        tag_list = tags.split()
+        tag_html = " ".join(f"<span style='display:inline-block; background:#1A1A1A; color:#FFCC00; padding:3px 8px; margin:3px 4px 3px 0; font-size:12px; border-radius:3px;'>{t}</span>" for t in tag_list)
+        tags_box = f"""
+<div style="background:#fff; border:3px solid #1A1A1A; padding:14px 18px; margin-top:24px; margin-bottom:20px;">
+  <h3 style="font-size:16px; font-weight:bold; margin-top:0; margin-bottom:10px;"># 태그</h3>
+  {tag_html}
+</div>
+"""
+        if "</body>" in html_content:
+            html_content = html_content.replace("</body>", f"{tags_box}\n</body>")
+        else:
+            html_content += tags_box
+
+        # 이미지 상대 경로 → 절대 경로 치환 (발행용 HTML에만 적용)
+        base_dir = os.path.dirname(file_path)
+        def make_abs_src(match):
+            img_tag = match.group(0)
+            src_m = re.search(r'src=["\'](.*?)["\']', img_tag, re.IGNORECASE)
+            if not src_m:
+                return img_tag
+            src = src_m.group(1)
+            if src.startswith("data:") or os.path.isabs(src):
+                return img_tag
+            abs_path = os.path.abspath(os.path.join(base_dir, src)).replace("\\", "/")
+            return re.sub(r'src=["\'](.*?)["\']', lambda m: f'src="{abs_path}"', img_tag, flags=re.IGNORECASE)
+
+        html_for_post = re.sub(r'<img[^>]+>', make_abs_src, html_content, flags=re.IGNORECASE)
+
+        # 발행용 HTML 보관 (에디터에는 평문 표시)
+        self.loaded_html_content = html_for_post
+
+        notice = (f"📄 {os.path.basename(file_path)}  |  "
+                  "발행 시 표·그래프 포함 원본 HTML이 전송됩니다.")
+
+        def update_gui():
+            self.blog_title_entry.delete(0, "end")
+            self.blog_title_entry.insert(0, title)
+            self.blog_content_text.delete("1.0", "end")
+            self.blog_content_text.insert("1.0", plain_content_with_tags)   # 평문 미리보기 (태그 포함)
+            self.blog_tags_entry.delete(0, "end")
+            self.blog_tags_entry.insert(0, tags)
+            self.html_notice_lbl.configure(text=notice)
+            print("[시스템] 평문 미리보기 및 태그 로드 완료.")
+
+        self.root.after(0, update_gui)
 
     # ──────────────────────────────────────────────
     # 공통 헬퍼
@@ -1045,11 +925,6 @@ class NaverPosterGUI:
 
     def _reset_button(self, btn: tk.Button, text: str, bg: str) -> None:
         btn.configure(state="normal", text=text, bg=bg)
-
-    def _clean_json(self, raw: str) -> str:
-        return re.sub(
-            r"^```(?:json)?\s*|\s*```\s*$", "", raw.strip(), flags=re.IGNORECASE
-        ).strip()
 
     def toggle_api_visibility(self) -> None:
         if self.api_visible:

@@ -7,6 +7,7 @@ a = Analysis(
     binaries=[],
     datas=[],
     hiddenimports=[
+        'config_manager',
         'undetected_chromedriver',
         'selenium',
         'selenium.webdriver',

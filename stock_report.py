@@ -227,7 +227,23 @@ class StockReportSection:
         self.open_btn.pack(side="left", padx=(6, 0))
         self.open_btn.bind("<Enter>", lambda e: self._hover(e, self.accent))
         self.open_btn.bind("<Leave>", lambda e: self._hover(e, self.primary))
+
+        self.blog_btn = tk.Button(
+            btn_row,
+            text="📤 발행",
+            font=("맑은 고딕", 10, "bold"),
+            bg="#2A7A2A", fg=self.text_light,
+            activebackground="#1E5C1E", activeforeground=self.text_light,
+            bd=0, relief="flat", cursor="hand2", padx=14, pady=12,
+            state="disabled",
+            command=self._send_to_blog,
+        )
+        self.blog_btn.pack(side="left", padx=(6, 0))
+        self.blog_btn.bind("<Enter>", lambda e: self._hover(e, "#1E5C1E"))
+        self.blog_btn.bind("<Leave>", lambda e: self._hover(e, "#2A7A2A"))
+
         self.last_html_path: str = ""
+        self._on_blog_ready_cb = None   # gui_app.py 에서 등록: fn(html_path)
         self._on_market_change()
 
         # ── 장 상태 표시줄 + 한·미 분석 변수 선택 패널 ──
@@ -530,11 +546,12 @@ class StockReportSection:
             fp = str(html_path)
             self.last_html_path = fp
             self.root.after(0, lambda: self.open_btn.configure(state="normal"))
+            self.root.after(0, lambda: self.blog_btn.configure(state="normal"))
             print(f"💾 저장 완료: {fp}\n" + "=" * 60)
             self.root.after(0, lambda: messagebox.showinfo(
                 "리포트 생성 완료",
                 f"주식 뉴스 리포트가 저장되었습니다!\n\n📁 {fp}\n\n"
-                "[🌐 열어보기] 버튼으로 브라우저에서 바로 열 수 있습니다.",
+                "[🌐 열어보기] 브라우저 미리보기  |  [📤 발행] 블로그 발행",
             ))
 
         except Exception as e:
@@ -569,6 +586,16 @@ class StockReportSection:
             webbrowser.open(Path(self.last_html_path).as_uri())
         else:
             messagebox.showinfo("열어보기", "먼저 리포트를 생성해 주세요.")
+
+    def _send_to_blog(self) -> None:
+        """마지막 리포트를 블로그 발행 탭으로 자동 전달한다."""
+        if not self.last_html_path or not Path(self.last_html_path).exists():
+            messagebox.showinfo("발행", "먼저 리포트를 생성해 주세요.")
+            return
+        if callable(self._on_blog_ready_cb):
+            self._on_blog_ready_cb(self.last_html_path)
+        else:
+            messagebox.showinfo("발행", "블로그 발행 연동이 설정되지 않았습니다.")
 
     # ──────────────────────────────────────────────
     # 티커 정규화 / 다운로드
@@ -671,22 +698,64 @@ class StockReportSection:
 
                 tk_obj = yf.Ticker(sym)
 
+                # 장중/장마감 무관하게 실시간 가격 데이터 가져오기 시도
+                live_price = None
+                live_volume = None
+                fast_prev = None
+                fast_open = None
+                fast_high = None
+                fast_low = None
+                try:
+                    fast = tk_obj.fast_info
+                    if fast:
+                        if hasattr(fast, "last_price") and fast.last_price is not None:
+                            live_price = float(fast.last_price)
+                        if hasattr(fast, "last_volume") and fast.last_volume is not None:
+                            live_volume = int(fast.last_volume)
+                        if hasattr(fast, "previous_close") and fast.previous_close is not None:
+                            fast_prev = float(fast.previous_close)
+                        if hasattr(fast, "open") and fast.open is not None:
+                            fast_open = float(fast.open)
+                        if hasattr(fast, "day_high") and fast.day_high is not None:
+                            fast_high = float(fast.day_high)
+                        if hasattr(fast, "day_low") and fast.day_low is not None:
+                            fast_low = float(fast.day_low)
+                except Exception:
+                    pass
+
+                # yfinance history에서 마지막 행이 nan일 경우 fast_price로 보정
+                import pandas as pd
+                if not hist.empty and live_price is not None:
+                    last_idx = hist.index[-1]
+                    if pd.isna(hist["Close"].iloc[-1]):
+                        hist.loc[last_idx, "Close"] = live_price
+                    
+                    # 만약 최신 거래일 행 자체가 history에 없다면 새 행 추가
+                    mkt_type = "us" if market == "🇺🇸 미국" else "kr"
+                    latest_mkt_date = self._get_latest_trading_date(mkt_type)
+                    last_hist_date = self._get_market_date(last_idx.to_pydatetime(), market)
+                    if latest_mkt_date > last_hist_date:
+                        tz = last_idx.tz
+                        new_ts = pd.Timestamp(latest_mkt_date).tz_localize(tz) if tz else pd.Timestamp(latest_mkt_date)
+                        
+                        # 새 행 데이터 준비
+                        new_row = {col: pd.NA for col in hist.columns}
+                        new_row["Close"] = live_price
+                        if "Open" in hist:
+                            new_row["Open"] = fast_open if fast_open is not None else live_price
+                        if "High" in hist:
+                            new_row["High"] = fast_high if fast_high is not None else live_price
+                        if "Low" in hist:
+                            new_row["Low"] = fast_low if fast_low is not None else live_price
+                        if "Volume" in hist:
+                            new_row["Volume"] = live_volume if live_volume is not None else 0
+                            
+                        hist.loc[new_ts] = new_row
+                        hist = hist.sort_index()
+
                 close = hist["Close"].dropna()
                 if close.empty:
                     continue
-
-                # 장중 실시간 가격 데이터 가져오기
-                live_price = None
-                live_volume = None
-                try:
-                    if self._is_market_active(market):
-                        fast = tk_obj.fast_info
-                        if fast and hasattr(fast, "last_price") and fast.last_price:
-                            live_price = float(fast.last_price)
-                        if fast and hasattr(fast, "last_volume") and fast.last_volume:
-                            live_volume = int(fast.last_volume)
-                except Exception:
-                    pass
 
                 close_list = list(close.values)
                 if live_price is not None:
@@ -697,32 +766,27 @@ class StockReportSection:
                 last  = float(close_list[-1])
                 prev  = float(close_list[-2]) if len(close_list) >= 2 else first
 
-                try:
-                    if self._is_market_active(market):
-                        fast = tk_obj.fast_info
-                        if fast and hasattr(fast, "previous_close") and fast.previous_close:
-                            prev = float(fast.previous_close)
-                except Exception:
-                    pass
+                if fast_prev is not None:
+                    prev = fast_prev
 
                 day_chg    = (last / prev - 1) * 100 if prev else 0.0
                 period_chg = (last / first - 1) * 100 if first else 0.0
                 
-                volume = int(hist["Volume"].iloc[-1]) if "Volume" in hist else 0
+                volume = int(hist["Volume"].iloc[-1]) if "Volume" in hist and not pd.isna(hist["Volume"].iloc[-1]) else 0
                 if live_volume is not None:
                     volume = live_volume
 
                 # 기간 고가/저가는 장중 High/Low 기준 (실제 최고·최저가)
-                high = float(hist["High"].max()) if "High" in hist else last
-                low  = float(hist["Low"].min())  if "Low"  in hist else last
+                high = float(hist["High"].dropna().max()) if "High" in hist and not hist["High"].dropna().empty else last
+                low  = float(hist["Low"].dropna().min())  if "Low" in hist and not hist["Low"].dropna().empty else last
                 if live_price is not None:
                     high = max(high, live_price)
                     low = min(low, live_price)
 
                 # 당일 시세 (네이버 일간 시세 형식)
-                day_open = float(hist["Open"].iloc[-1]) if "Open" in hist else last
-                day_high = float(hist["High"].iloc[-1]) if "High" in hist else last
-                day_low  = float(hist["Low"].iloc[-1])  if "Low"  in hist else last
+                day_open = fast_open if fast_open is not None else (float(hist["Open"].iloc[-1]) if "Open" in hist and not pd.isna(hist["Open"].iloc[-1]) else last)
+                day_high = fast_high if fast_high is not None else (float(hist["High"].iloc[-1]) if "High" in hist and not pd.isna(hist["High"].iloc[-1]) else last)
+                day_low  = fast_low  if fast_low  is not None else (float(hist["Low"].iloc[-1])  if "Low"  in hist and not pd.isna(hist["Low"].iloc[-1])  else last)
                 if live_price is not None:
                     day_high = max(day_high, live_price)
                     day_low = min(day_low, live_price)
@@ -788,6 +852,38 @@ class StockReportSection:
             if dt.tzinfo is not None:
                 return dt.astimezone(KST).date()
             return dt.date()
+
+    def _get_latest_trading_date(self, market_type: str) -> date:
+        now_kst = datetime.now(KST)
+        if market_type == "us":
+            et = self._kst_to_et(now_kst)
+            w = et.weekday()
+            t = et.time()
+            if w == 5:
+                return (et - timedelta(days=1)).date()
+            elif w == 6:
+                return (et - timedelta(days=2)).date()
+            if t < dtime(9, 30):
+                if w == 0:
+                    return (et - timedelta(days=3)).date()
+                else:
+                    return (et - timedelta(days=1)).date()
+            else:
+                return et.date()
+        else:
+            w = now_kst.weekday()
+            t = now_kst.time()
+            if w == 5:
+                return (now_kst - timedelta(days=1)).date()
+            elif w == 6:
+                return (now_kst - timedelta(days=2)).date()
+            if t < dtime(9, 0):
+                if w == 0:
+                    return (now_kst - timedelta(days=3)).date()
+                else:
+                    return (now_kst - timedelta(days=1)).date()
+            else:
+                return now_kst.date()
 
     def _is_market_active(self, market: str) -> bool:
         now_kst = datetime.now(KST)
@@ -1045,7 +1141,7 @@ class StockReportSection:
                         index_data.append({"name": name, "last": q["last"], "diff": q["diff"], "pct": q["pct"]})
                         continue
 
-                if market == "🇺🇸 미국" and self._is_market_active(market):
+                if market == "🇺🇸 미국":
                     try:
                         tk = yf.Ticker(sym)
                         fast = tk.fast_info
@@ -1060,12 +1156,14 @@ class StockReportSection:
                         print(f"  [경고] {name} 지수 실시간 수집 실패: {fe}")
 
                 h = yf.Ticker(sym).history(period="5d", interval="1d", auto_adjust=False)
-                if h is not None and len(h) >= 2:
-                    prev = float(h["Close"].iloc[-2])
-                    last = float(h["Close"].iloc[-1])
-                    diff = last - prev
-                    pct  = (diff / prev * 100) if prev else 0
-                    index_data.append({"name": name, "last": last, "diff": diff, "pct": pct})
+                if h is not None:
+                    close_series = h["Close"].dropna()
+                    if len(close_series) >= 2:
+                        prev = float(close_series.iloc[-2])
+                        last = float(close_series.iloc[-1])
+                        diff = last - prev
+                        pct  = (diff / prev * 100) if prev else 0
+                        index_data.append({"name": name, "last": last, "diff": diff, "pct": pct})
             except Exception as e:
                 print(f"  [경고] {name} 지수: {e}")
         return index_data
@@ -1351,6 +1449,8 @@ class StockReportSection:
 - 뉴스 헤드라인과 가격 흐름을 연결해 해석{cross_rule}
 - 과장·투자 권유 금지, 객관적 사실 기반
 - 마크다운/코드블록 없이 일반 문단 텍스트로만 출력
+- 본문 내용 중 중요 단어는 반드시 **중요단어** 형식으로 볼드(bold) 처리해 주세요.
+- 수치나 변화량의 경우, 상승/증가 등은 가능한 한 '+' 기호를, 하락/감소 등은 '-' 기호를 숫자 앞에 붙여서 표현해 주세요. (예: +3.42%, -0.10%)
 - 시장 종합 요약 → (종목 선택 시) 종목별 코멘트 → 한·미 교차 분석 → 유의점 순서, 900~1400자"""
 
         user = (
@@ -1534,11 +1634,16 @@ class StockReportSection:
             if p_clean.startswith('#'):
                 p_clean = re.sub(r'^#+\s*', '', p_clean)
                 p_clean = re.sub(r'[#\*\_]+', '', p_clean).strip()
-                analysis_html += f"<h3>{html.escape(p_clean)}</h3>"
+                analysis_html += f"<h3><b>{html.escape(p_clean)}</b></h3>"
             else:
                 p_html = html.escape(p_clean)
                 p_html = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', p_html)
                 p_html = re.sub(r'\*(.*?)\*', r'<i>\1</i>', p_html)
+                
+                # 수치(+/-) 색상화 및 볼드 처리
+                p_html = re.sub(r'(\+(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?(?:%|p|포인트|원|달러|배|억원|%p)?)', r'<b style="color: #E63B2E;">\1</b>', p_html)
+                p_html = re.sub(r'(\-(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?(?:%|p|포인트|원|달러|배|억원|%p)?)', r'<b style="color: #0055FF;">\1</b>', p_html)
+                
                 analysis_html += f"<p>{p_html}</p>"
 
         # ── 장 상태 헤더 ──
@@ -1591,6 +1696,29 @@ class StockReportSection:
 
         sections = [status_html]
 
+        # ① 종합 분석 — 글의 핵심이므로 최상단
+        sections.append(H2("종합 분석 (한·미 교차 해석)") + analysis_html)
+
+        # ② ③ 거시지표 — 선택 시장 우선 (해당 국가 위주)
+        if market == "🇰🇷 한국":
+            if macro.get("kr"):
+                sections.append(H2("한국 시장 거시지표") + macro_tables(macro["kr"]))
+            if macro.get("us"):
+                sections.append(H2("미국 시장 거시지표") + macro_tables(macro["us"]))
+        else:
+            if macro.get("us"):
+                sections.append(H2("미국 시장 거시지표") + macro_tables(macro["us"]))
+            if macro.get("kr"):
+                sections.append(H2("한국 시장 거시지표") + macro_tables(macro["kr"]))
+
+        # ④ 키워드 중심 뉴스
+        if keyword_news_trs:
+            sections.append(
+                H2("키워드 중심 뉴스")
+                + "<table><tr><th>키워드</th><th>날짜</th><th>헤드라인</th></tr>"
+                + keyword_news_trs + "</table>")
+
+        # ⑤ ⑥ ⑦ ⑧ 시세·그래프·종목 뉴스
         if price_rows:
             sections.append(
                 H2(title_prefix,
@@ -1615,19 +1743,6 @@ class StockReportSection:
                     H2("종목별 뉴스")
                     + "<table><tr><th>종목</th><th>날짜</th><th>헤드라인</th></tr>"
                     + news_trs + "</table>")
-
-        if keyword_news_trs:
-            sections.append(
-                H2("키워드 중심 뉴스")
-                + "<table><tr><th>키워드</th><th>날짜</th><th>헤드라인</th></tr>"
-                + keyword_news_trs + "</table>")
-
-        if macro.get("kr"):
-            sections.append(H2("한국 시장 거시지표") + macro_tables(macro["kr"]))
-        if macro.get("us"):
-            sections.append(H2("미국 시장 거시지표") + macro_tables(macro["us"]))
-
-        sections.append(H2("종합 분석 (한·미 교차 해석)") + analysis_html)
         body = "\n".join(sections)
 
         doc = f"""<!DOCTYPE html>
