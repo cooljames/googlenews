@@ -526,64 +526,56 @@ def write_post(driver, uid, title, content, tags=""):
     clipboard_paste(driver, body_el, content)
     time.sleep(1.0)
 
-    # 에디터 태그 입력 (발행 전 태그 섹션)
-    tag_entered = False
-    if tags:
-        tag_list = re.findall(r"#?([^\s#]+)", tags)
-        tag_list = [t for t in tag_list if t]
-        # 중복 태그 제거 (순서 보존)
-        seen_tags = set()
-        tag_list = [t for t in tag_list if not (t in seen_tags or seen_tags.add(t))]
-        tag_selectors = [
-            ".se-tag-input",
-            ".tag-input",
-            "input.se_input_text",
-            ".se_tag input",
-            "input[placeholder*='태그']",
-            "input[placeholder*='tag']",
-            ".tag_area input",
-            ".se-section-tag input",
-        ]
-        for sel in tag_selectors:
+    # 이미지 플레이스홀더를 찾아서 클립보드 이미지로 치환하여 자동 업로드
+    print("[이미지 업로드] 플레이스홀더 변환 및 자동 붙여넣기를 시작합니다...")
+    while True:
+        try:
+            placeholder_el = None
             try:
-                tag_el = driver.find_element(By.CSS_SELECTOR, sel)
-                if tag_el.is_displayed():
-                    for tag in tag_list:
-                        clipboard_paste(driver, tag_el, tag, force_plain=True)
-                        time.sleep(0.2)
-                        tag_el.send_keys(Keys.RETURN)
-                        time.sleep(0.2)
-                    tag_entered = True
-                    print(f"[태그] 에디터 태그 섹션에 {len(tag_list)}개 입력 완료")
-                    break
+                placeholder_el = driver.find_element(By.XPATH, "//*[contains(text(), '[IMAGE_FILE:')]")
             except Exception:
+                break # 더 이상 플레이스홀더가 존재하지 않으면 루프 탈출
+                
+            text = placeholder_el.text
+            match = re.search(r'\[IMAGE_FILE:(.*?)\]', text)
+            if not match:
+                driver.execute_script("arguments[0].textContent = '';", placeholder_el)
                 continue
-        if not tag_entered:
-            # JavaScript 기반 탐색
-            js_find_tag = """
-            var inputs = document.querySelectorAll('input');
-            for (var i=0; i<inputs.length; i++){
-                var ph = (inputs[i].placeholder||'').toLowerCase();
-                if (ph.indexOf('태그')!==-1 || ph.indexOf('tag')!==-1){
-                    return inputs[i];
-                }
-            }
-            return null;
-            """
-            try:
-                tag_el = driver.execute_script(js_find_tag)
-                if tag_el:
-                    for tag in tag_list:
-                        clipboard_paste(driver, tag_el, tag, force_plain=True)
-                        time.sleep(0.2)
-                        tag_el.send_keys(Keys.RETURN)
-                        time.sleep(0.2)
-                    tag_entered = True
-                    print(f"[태그] JS 탐색으로 {len(tag_list)}개 입력 완료")
-            except Exception as e:
-                print(f"[태그] JS 탐색 실패: {e}")
-        if not tag_entered:
-            print("⚠️ [태그] 에디터 태그 입력 필드를 찾지 못했습니다. 발행 설정 창에서 재시도합니다.")
+                
+            img_path = match.group(1).strip()
+            print(f"[이미지 업로드] 플레이스홀더 발견: {img_path}")
+            
+            import utils
+            if utils.copy_image_to_clipboard(img_path):
+                # 브라우저에서 무한 루프 인식을 방지하기 위해 플레이스홀더 텍스트를 먼저 비웁니다.
+                driver.execute_script("arguments[0].innerHTML = '<br>';", placeholder_el)
+                time.sleep(0.2)
+                
+                # 비워진 플레이스홀더 영역을 블록 지정하여 해당 위치에 이미지가 삽입되도록 합니다.
+                driver.execute_script("""
+                    var range = document.createRange();
+                    range.selectNodeContents(arguments[0]);
+                    var sel = window.getSelection();
+                    sel.removeAllRanges();
+                    sel.addRange(range);
+                """, placeholder_el)
+                time.sleep(0.3)
+                
+                # Ctrl+V 붙여넣기 실행
+                actions = ActionChains(driver)
+                actions.key_down(Keys.CONTROL).send_keys("v").key_up(Keys.CONTROL).perform()
+                time.sleep(2.5) # 네이버 서버로 이미지 업로드 대기
+                print(f"[이미지 업로드] 이미지 붙여넣기 완료: {img_path}")
+            else:
+                print(f"[경고] 이미지 복사 실패: {img_path}")
+                driver.execute_script("arguments[0].textContent = '';", placeholder_el)
+                
+        except Exception as img_err:
+            print(f"[경고] 이미지 플레이스홀더 처리 중 에러 발생: {img_err}")
+            break
+
+    # 태그 입력은 본문에 포함되어 이미 한 번에 등록되었으므로 에디터 태그 입력 루틴 생략
+    tag_entered = True
 
     print("📤 글 발행 처리 중...")
     # 1. 상단 발행 버튼 클릭
@@ -684,59 +676,8 @@ def write_post(driver, uid, title, content, tags=""):
 
     time.sleep(1.0)
 
-    # 2-1. 발행 설정 패널 내 태그 입력 (에디터 태그 섹션에서 실패했을 경우에만 실행)
-    if tags and not tag_entered:
-        tag_list = re.findall(r"#?([^\s#]+)", tags)
-        tag_list = [t for t in tag_list if t]
-        # 중복 태그 제거 (순서 보존)
-        seen_tags = set()
-        tag_list = [t for t in tag_list if not (t in seen_tags or seen_tags.add(t))]
-        publish_tag_selectors = [
-            ".se-publish-tag-area input",
-            ".se-publish-section-tag input",
-            ".publish_tag_wrap input",
-            "input[class*='publish'][class*='tag']",
-            ".se-popup-tag-input",
-            "input[placeholder*='태그']",
-            "input[placeholder*='tag']",
-        ]
-        publish_tag_entered = False
-        for sel in publish_tag_selectors:
-            try:
-                tag_el = driver.find_element(By.CSS_SELECTOR, sel)
-                if tag_el.is_displayed():
-                    for tag in tag_list:
-                        clipboard_paste(driver, tag_el, tag, force_plain=True)
-                        time.sleep(0.2)
-                        tag_el.send_keys(Keys.RETURN)
-                        time.sleep(0.2)
-                    publish_tag_entered = True
-                    print(f"[태그] 발행 설정 패널에 {len(tag_list)}개 태그 입력 완료")
-                    break
-            except Exception:
-                continue
-        if not publish_tag_entered:
-            js_publish_tag = """
-            var inputs = document.querySelectorAll('input');
-            for (var i=0; i<inputs.length; i++){
-                var ph = (inputs[i].placeholder||'').toLowerCase();
-                if (ph.indexOf('태그')!==-1 || ph.indexOf('tag')!==-1){
-                    return inputs[i];
-                }
-            }
-            return null;
-            """
-            try:
-                tag_el = driver.execute_script(js_publish_tag)
-                if tag_el:
-                    for tag in tag_list:
-                        clipboard_paste(driver, tag_el, tag, force_plain=True)
-                        time.sleep(0.2)
-                        tag_el.send_keys(Keys.RETURN)
-                        time.sleep(0.2)
-                    print(f"[태그] JS 탐색으로 발행 패널 태그 {len(tag_list)}개 입력 완료")
-            except Exception as e:
-                print(f"[태그] 발행 패널 태그 입력 실패: {e}")
+    # 태그 입력은 본문에 포함되어 이미 등록되었으므로 생략
+    pass
 
     time.sleep(0.5)
 

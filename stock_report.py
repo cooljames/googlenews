@@ -45,12 +45,10 @@ matplotlib.rcParams["axes.unicode_minus"] = False
 
 # 기간: 표시명 → (yfinance period, 뉴스 검색 when:)
 PERIOD_PRESETS = {
-    "장전후": ("5d", "5d"),
-    "장중": ("5d", "5d"),
     "1주": ("7d",  "7d"),
-    "1개월": ("1mo", "14d"),
-    "3개월": ("3mo", "14d"),
-    "6개월": ("6mo", "30d"),
+    "1월": ("1mo", "14d"),
+    "3월": ("3mo", "14d"),
+    "6월": ("6mo", "30d"),
     "1년":  ("1y",  "30d"),
     "3년":  ("3y",  "30d"),
     "5년":  ("5y",  "30d"),
@@ -161,8 +159,7 @@ class StockReportSection:
 
         tk.Label(opt_row, text="기간:", font=("맑은 고딕", 9, "bold"),
                  bg=self.bg_card, fg=self.text_dark).pack(side="left", padx=(0, 4))
-        is_kr_active = self._is_market_active("🇰🇷 한국")
-        self.period_var = tk.StringVar(value="장중" if is_kr_active else "장전후")
+        self.period_var = tk.StringVar(value="1주")
         ttk.Combobox(opt_row, textvariable=self.period_var,
                      values=list(PERIOD_PRESETS.keys()),
                      state="readonly", width=8, font=("맑은 고딕", 9)
@@ -902,8 +899,25 @@ class StockReportSection:
 
     def _on_market_change(self, event=None):
         market = self.market_var.get()
-        is_active = self._is_market_active(market)
-        self.period_var.set("장중" if is_active else "장전후")
+        
+        # 시총 상위 10위 티커 자동 가져오기
+        import utils
+        def fetch_and_populate():
+            self._set_status(f"{market} 시총 상위 10위 티커 가져오는 중...")
+            try:
+                tickers = utils.fetch_top_10_tickers(market)
+                if tickers:
+                    self.root.after(0, lambda: self._update_ticker_entry(tickers))
+            except Exception as e:
+                print(f"[경고] 시총 상위 10위 티커 가져오기 실패: {e}")
+                self._set_status("티커 자동 가져오기 실패")
+
+        threading.Thread(target=fetch_and_populate, daemon=True).start()
+
+    def _update_ticker_entry(self, tickers: list) -> None:
+        self.ticker_entry.delete(0, "end")
+        self.ticker_entry.insert(0, ", ".join(tickers))
+        self._set_status(f"{self.market_var.get()} 시총 상위 10위 티커 로드 완료.")
 
     def _fmt_dt(self, ts, market: str = "🇰🇷 한국") -> str:
         """최종 거래일 + 시간으로 표기.
@@ -1011,28 +1025,12 @@ class StockReportSection:
                     if not h.get("dt"):
                         continue
                         
-                    if period_label in ["장전후", "장중"]:
-                        if market == "🇺🇸 미국":
-                            dt_local = self._kst_to_et(h["dt"])
-                        else:
-                            dt_local = h["dt"].astimezone(KST).replace(tzinfo=None)
-                            
-                        if dt_local.date() != last_date:
-                            continue
-                            
-                        if period_label == "장전후":
-                            if not (dt_local.time() < open_time or dt_local.time() > close_time):
-                                continue
-                        elif period_label == "장중":
-                            if not (open_time <= dt_local.time() <= close_time):
-                                continue
-                    else:
-                        if not self._is_in_filter(h["dt"], filter_type, market, row["last_dt"]):
-                            continue
+                    if not self._is_in_filter(h["dt"], filter_type, market, row["last_dt"]):
+                        continue
                             
                     fresh.append(h)
                 out[sym] = fresh[:6]
-                print(f"  ✓ {sym} 뉴스 필터({period_label if period_label in ['장전후', '장중'] else filter_type}) 적용 후 뉴스 {len(out[sym])}건")
+                print(f"  ✓ {sym} 뉴스 필터({filter_type}) 적용 후 뉴스 {len(out[sym])}건")
             except Exception as e:
                 print(f"  [경고] {sym} 뉴스 수집 실패: {e}")
                 out[sym] = []
@@ -1051,28 +1049,12 @@ class StockReportSection:
                     if not h.get("dt"):
                         continue
                         
-                    if period_label in ["장전후", "장중"]:
-                        if market == "🇺🇸 미국":
-                            dt_local = self._kst_to_et(h["dt"])
-                        else:
-                            dt_local = h["dt"].astimezone(KST).replace(tzinfo=None)
-                            
-                        if dt_local.date() != target_date_fallback:
-                            continue
-                            
-                        if period_label == "장전후":
-                            if not (dt_local.time() < open_time or dt_local.time() > close_time):
-                                continue
-                        elif period_label == "장중":
-                            if not (open_time <= dt_local.time() <= close_time):
-                                continue
-                    else:
-                        if not self._is_in_filter(h["dt"], filter_type, market, now.strftime("%Y-%m-%d %H:%M")):
-                            continue
+                    if not self._is_in_filter(h["dt"], filter_type, market, now.strftime("%Y-%m-%d %H:%M")):
+                        continue
                             
                     fresh.append(h)
                 out[kw] = fresh[:6]
-                print(f"  ✓ '{kw}' 뉴스 필터({period_label if period_label in ['장전후', '장중'] else filter_type}) 적용 후 뉴스 {len(out[kw])}건")
+                print(f"  ✓ '{kw}' 뉴스 필터({filter_type}) 적용 후 뉴스 {len(out[kw])}건")
             except Exception as e:
                 print(f"  [경고] '{kw}' 뉴스 수집 실패: {e}")
                 out[kw] = []
@@ -1630,6 +1612,7 @@ class StockReportSection:
         for p in analysis.split("\n"):
             p_clean = p.strip()
             if not p_clean:
+                analysis_html += "<p>&nbsp;</p>"
                 continue
             if p_clean.startswith('#'):
                 p_clean = re.sub(r'^#+\s*', '', p_clean)

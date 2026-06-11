@@ -93,3 +93,95 @@ def resolve_html_images_to_base64(html_content: str) -> str:
         return img_tag
 
     return re.sub(r'<img[^>]+>', replace_img, html_content, flags=re.IGNORECASE)
+
+def fetch_top_10_tickers(market: str) -> list:
+    """각 국가별 시총 순위 10위 까지의 티커를 자동으로 가져옵니다."""
+    import urllib.request
+    import json
+    import re
+    
+    if market == "🇺🇸 미국":
+        url = 'https://companiesmarketcap.com/usa/largest-companies-in-the-usa-by-market-cap/'
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                html_data = resp.read().decode('utf-8')
+            matches = re.findall(r'<div class="company-code">.*?</span>(.*?)</div>', html_data)
+            tickers = [m.strip() for m in matches if m.strip().isalpha()][:10]
+            if tickers:
+                tickers = [t if t != "BRKB" else "BRK-B" for t in tickers]
+                return tickers
+        except Exception as e:
+            print(f"[경고] 미국 시총 상위 티커 스크래핑 실패: {e}")
+        return ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "BRK-B", "LLY", "AVGO", "TSLA"]
+        
+    else:  # "🇰🇷 한국"
+        try:
+            req_kospi = urllib.request.Request(
+                'https://m.stock.naver.com/api/stocks/marketValue/KOSPI?page=1&pageSize=15',
+                headers={'User-Agent': 'Mozilla/5.0'}
+            )
+            with urllib.request.urlopen(req_kospi, timeout=10) as resp:
+                kospi_data = json.loads(resp.read().decode('utf-8'))
+            
+            req_kosdaq = urllib.request.Request(
+                'https://m.stock.naver.com/api/stocks/marketValue/KOSDAQ?page=1&pageSize=15',
+                headers={'User-Agent': 'Mozilla/5.0'}
+            )
+            with urllib.request.urlopen(req_kosdaq, timeout=10) as resp:
+                kosdaq_data = json.loads(resp.read().decode('utf-8'))
+                
+            combined = kospi_data.get('stocks', []) + kosdaq_data.get('stocks', [])
+            combined = sorted(combined, key=lambda s: int(s.get('marketValueRaw', 0) or 0), reverse=True)
+            
+            tickers = []
+            for s in combined[:10]:
+                code = s['itemCode']
+                ex = s.get('stockExchangeType', {})
+                ex_code = ex.get('code', 'KS') if isinstance(ex, dict) else str(ex or 'KS')
+                tickers.append(f"{code}.{ex_code}")
+            if tickers:
+                return tickers
+        except Exception as e:
+            print(f"[경고] 한국 시총 상위 티커 조회 실패: {e}")
+        return ["005930.KS", "000660.KS", "373220.KS", "207940.KS", "005935.KS", "005380.KS", "068270.KS", "000270.KS", "005490.KS", "105560.KS"]
+
+def copy_image_to_clipboard(image_path: str) -> bool:
+    """Windows 클립보드에 이미지를 Device-Independent Bitmap (CF_DIB) 형태로 복사합니다."""
+    import ctypes
+    from PIL import Image
+    from io import BytesIO
+    
+    if not os.path.exists(image_path):
+        print(f"[클립보드] 이미지 파일이 존재하지 않습니다: {image_path}")
+        return False
+        
+    try:
+        img = Image.open(image_path)
+        output = BytesIO()
+        img.convert("RGB").save(output, "BMP")
+        data = output.getvalue()[14:]  # BMP 헤더 14바이트 제거
+        output.close()
+        
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        
+        if user32.OpenClipboard(None):
+            try:
+                user32.EmptyClipboard()
+                CF_DIB = 8
+                GMEM_MOVEABLE = 0x0002
+                h_mem = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+                if h_mem:
+                    p_mem = kernel32.GlobalLock(h_mem)
+                    if p_mem:
+                        ctypes.memmove(p_mem, data, len(data))
+                        kernel32.GlobalUnlock(h_mem)
+                        user32.SetClipboardData(CF_DIB, h_mem)
+                        return True
+            finally:
+                user32.CloseClipboard()
+    except Exception as e:
+        print(f"[클립보드] 이미지 복사 중 에러 발생: {e}")
+    return False
+

@@ -817,7 +817,7 @@ class NaverPosterGUI:
         self.import_btn.configure(state="disabled", text="리포트 불러오는 중... ⏳", bg=self.gray)
 
         def run():
-            self._do_load_html_data(file_path, cfg)
+            self._do_load_html_data(file_path, cfg, auto_post=True)
 
         def success(result):
             self.import_btn.configure(state="normal", text="📂 기존 HTML 파일 열기", bg=self.accent)
@@ -828,7 +828,7 @@ class NaverPosterGUI:
 
         self.thread_manager.run_async(run, on_success=success, on_failure=failure)
 
-    def _do_load_html_data(self, file_path: str, cfg: dict) -> None:
+    def _do_load_html_data(self, file_path: str, cfg: dict, auto_post: bool = False) -> None:
         """HTML 파일을 읽어 평문 미리보기를 에디터에, 원본 HTML을 내부에 보관한다."""
         import os
         print("\n" + "=" * 60)
@@ -894,20 +894,20 @@ class NaverPosterGUI:
             else:
                 html_content += tags_box
 
-        # 이미지 상대 경로 → 절대 경로 치환 (발행용 HTML에만 적용)
+        # 이미지 상대 경로 → 절대 경로 플레이스홀더 치환 (발행용 HTML에만 적용)
         base_dir = os.path.dirname(file_path)
-        def make_abs_src(match):
+        def make_placeholder(match):
             img_tag = match.group(0)
             src_m = re.search(r'src=["\'](.*?)["\']', img_tag, re.IGNORECASE)
             if not src_m:
                 return img_tag
             src = src_m.group(1)
-            if src.startswith("data:") or os.path.isabs(src):
+            if src.startswith("data:"):
                 return img_tag
             abs_path = os.path.abspath(os.path.join(base_dir, src)).replace("\\", "/")
-            return re.sub(r'src=["\'](.*?)["\']', lambda m: f'src="{abs_path}"', img_tag, flags=re.IGNORECASE)
+            return f"<p>[IMAGE_FILE:{abs_path}]</p>"
 
-        html_for_post = re.sub(r'<img[^>]+>', make_abs_src, html_content, flags=re.IGNORECASE)
+        html_for_post = re.sub(r'<img[^>]+>', make_placeholder, html_content, flags=re.IGNORECASE)
 
         # 발행용 HTML 보관 (에디터에는 평문 표시)
         self.loaded_html_content = html_for_post
@@ -924,6 +924,10 @@ class NaverPosterGUI:
             self.blog_tags_entry.insert(0, tags)
             self.html_notice_lbl.configure(text=notice)
             print("[시스템] 평문 미리보기 및 태그 로드 완료.")
+            
+            if auto_post:
+                print("[시스템] 자동 발행을 시작합니다...")
+                self.start_posting_process_thread()
 
         self.root.after(0, update_gui)
 

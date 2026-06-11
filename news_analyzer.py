@@ -687,6 +687,7 @@ class NewsAnalyzerSection:
             for p in str(analysis).split("\n"):
                 p_clean = p.strip()
                 if not p_clean:
+                    paras += "<p>&nbsp;</p>"
                     continue
                 if p_clean.startswith('#'):
                     p_clean = re.sub(r'^#+\s*', '', p_clean)
